@@ -12,17 +12,15 @@
 #include <CrossBuildRuntime.h>
 #include "Hooking.h"
 
-#include <LaunchMode.h>
-
 #include <sysAllocator.h>
 
 #include <MinHook.h>
 #include <ICoreGameInit.h>
 
 #include <unordered_set>
+#include <unordered_map>
 
-extern void PointerArgumentSafety();
-extern bool storyMode;
+static bool storyMode;
 
 #if __has_include("scrEngineStubs.h")
 #include <scrEngineStubs.h>
@@ -32,6 +30,64 @@ inline void HandlerFilter(void* handler)
 
 }
 #endif
+
+static std::unordered_map<uint64_t, int> g_nativeBlockedBeforeBuild = {
+	// Natives that are banned on all builds.
+
+	{0x9BAE5AD2508DF078, std::numeric_limits<int>::max()}, // SET_INSTANCE_PRIORITY_MODE (prop density lowering)
+	{0x5A5F40FE637EB584, std::numeric_limits<int>::max()}, // STRING_TO_INT
+	{0xE80492A9AC099A93, std::numeric_limits<int>::max()}, // CLEAR_BIT
+	{0x8EF07E15701D61ED, std::numeric_limits<int>::max()}, // SET_BITS_IN_RANGE
+	{0x933D6A9EEC1BACD0, std::numeric_limits<int>::max()}, // SET_BIT
+	{0x213AEB2B90CBA7AC, std::numeric_limits<int>::max()}, // _COPY_MEMORY
+
+	// DATAFILE namespace
+
+	{0x6CC86E78358D5119, std::numeric_limits<int>::max()}, // DATAFILE_CLEAR_WATCH_LIST
+	{0xD27058A1CA2B13EE, std::numeric_limits<int>::max()}, // DATAFILE_CREATE
+	{0x9AB9C1CFC8862DFB, std::numeric_limits<int>::max()}, // DATAFILE_DELETE
+	{0x8F5EA1C01D65A100, std::numeric_limits<int>::max()}, // DATAFILE_DELETE_REQUESTED_FILE
+	{0xC55854C7D7274882, std::numeric_limits<int>::max()}, // DATAFILE_FLUSH_MISSION_HEADER
+	{0x906B778CA1DC72B6, std::numeric_limits<int>::max()}, // DATAFILE_GET_FILE_DICT
+	{0x15FF52B809DB2353, std::numeric_limits<int>::max()}, // DATAFILE_HAS_LOADED_FILE_DATA
+	{0xF8CC1EBE0B62E29F, std::numeric_limits<int>::max()}, // DATAFILE_HAS_VALID_FILE_DATA
+	{0xBEDB96A7584AA8CF, std::numeric_limits<int>::max()}, // DATAFILE_IS_SAVE_PENDING
+	{0xFCCAE5B92A830878, std::numeric_limits<int>::max()}, // DATAFILE_IS_VALID_REQUEST_ID
+	{0xC5238C011AF405E4, std::numeric_limits<int>::max()}, // DATAFILE_LOAD_OFFLINE_UGC
+	{0x22DA66936E0FFF37, std::numeric_limits<int>::max()}, // DATAFILE_SELECT_ACTIVE_FILE
+	{0x01095C95CD46B624, std::numeric_limits<int>::max()}, // DATAFILE_SELECT_CREATOR_STATS
+	{0xA69AC4ADE82B57A4, std::numeric_limits<int>::max()}, // DATAFILE_SELECT_UGC_DATA
+	{0x52818819057F2B40, std::numeric_limits<int>::max()}, // DATAFILE_SELECT_UGC_PLAYER_DATA
+	{0x9CB0BFA7A9342C3D, std::numeric_limits<int>::max()}, // DATAFILE_SELECT_UGC_STATS
+	{0x83BCCE3224735F05, std::numeric_limits<int>::max()}, // DATAFILE_START_SAVE_TO_CLOUD
+	{0x2ED61456317B8178, std::numeric_limits<int>::max()}, // DATAFILE_STORE_MISSION_HEADER
+	{0x4DFDD9EB705F8140, std::numeric_limits<int>::max()}, // DATAFILE_UPDATE_SAVE_TO_CLOUD
+	{0xAD6875BBC0FC899C, std::numeric_limits<int>::max()}, // DATAFILE_WATCH_REQUEST_ID
+
+	{0xF8B0F5A43E928C76, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_BOOL
+	{0x6889498B3E19C797, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_DICT
+	{0x57A995FD75D37F56, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_FLOAT
+	{0xCABDB751D86FE93B, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_INT
+	{0x2F0661C155AEEEAA, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_STRING
+	{0x407F8D034F70F0C2, std::numeric_limits<int>::max()}, // DATAARRAY_ADD_VECTOR
+	{0x50C1B2874E50C114, std::numeric_limits<int>::max()}, // DATAARRAY_GET_BOOL
+	{0x065DB281590CEA2D, std::numeric_limits<int>::max()}, // DATAARRAY_GET_COUNT
+	{0x8B5FADCC4E3A145F, std::numeric_limits<int>::max()}, // DATAARRAY_GET_DICT
+	{0xC0C527B525D7CFB5, std::numeric_limits<int>::max()}, // DATAARRAY_GET_FLOAT
+	{0x3E5AE19425CD74BE, std::numeric_limits<int>::max()}, // DATAARRAY_GET_INT
+	{0xD3F2FFEB8D836F52, std::numeric_limits<int>::max()}, // DATAARRAY_GET_STRING
+	{0x3A0014ADB172A3C5, std::numeric_limits<int>::max()}, // DATAARRAY_GET_TYPE
+	{0x8D2064E5B64A628A, std::numeric_limits<int>::max()}, // DATAARRAY_GET_VECTOR
+
+	{0x6AD0BD5E087866CB, std::numeric_limits<int>::max()},
+	{0xA6EEF01087181EDD, std::numeric_limits<int>::max()},
+	{0xDBF860CF1DB8E599, std::numeric_limits<int>::max()},
+
+	// Natives that were introduces after a certain build and are closely coupled with the DLC content.
+	// When running new game executable with old DLC set - we have to explicitly disable these natives.
+
+	{0x5E1460624D194A38, 2189} // SET_USE_ISLAND_MAP
+};
 
 fwEvent<> rage::scrEngine::OnScriptInit;
 fwEvent<bool&> rage::scrEngine::CheckNativeScriptAllowed;
@@ -45,44 +101,6 @@ static uint32_t* scrThreadCount;
 rage::scriptHandlerMgr* g_scriptHandlerMgr;
 
 static bool g_hasObfuscated;
-
-struct NativeRegistration_old
-{
-	NativeRegistration_old* nextRegistration;
-	rage::scrEngine::NativeHandler handlers[7];
-	uint32_t numEntries;
-	uint64_t hashes[7];
-
-	inline NativeRegistration_old* getNextRegistration()
-	{
-		return nextRegistration;
-	}
-
-	inline void setNextRegistration(NativeRegistration_old* registration)
-	{
-		nextRegistration = registration;
-	}
-
-	inline uint32_t getNumEntries()
-	{
-		return numEntries;
-	}
-
-	inline void setNumEntries(uint32_t entries)
-	{
-		numEntries = entries;
-	}
-
-	inline uint64_t getHash(uint32_t index)
-	{
-		return hashes[index];
-	}
-
-	inline void setHash(uint32_t index, uint64_t newHash)
-	{
-		hashes[index] = newHash;
-	}
-};
 
 // see https://github.com/ivanmeler/OpenVHook/blob/b5b4d84e76feb05a988e9d69b6b5c164458341cb/OpenVHook/Scripting/ScriptEngine.cpp#L22
 #pragma pack(push, 1)
@@ -311,6 +329,7 @@ void scrEngine::CreateThread(GtaThread* thread)
 }
 
 uint64_t MapNative(uint64_t inNative);
+void ReviveNative(uint64_t inNative);
 
 template<typename TReg>
 bool RegisterNativeOverride(uint64_t hash, scrEngine::NativeHandler handler)
@@ -384,14 +403,7 @@ void RegisterNativeDo(uint64_t hash, scrEngine::NativeHandler handler)
 
 void RegisterNative(uint64_t hash, scrEngine::NativeHandler handler)
 {
-	if (Is372())
-	{
-		RegisterNativeDo<NativeRegistration_old>(hash, handler);
-	}
-	else
-	{
-		RegisterNativeDo<NativeRegistration_obf>(hash, handler);
-	}
+	RegisterNativeDo<NativeRegistration_obf>(hash, handler);
 }
 
 static std::vector<std::pair<uint64_t, scrEngine::NativeHandler>> g_nativeHandlers;
@@ -404,6 +416,42 @@ void scrEngine::RegisterNativeHandler(const char* nativeName, NativeHandler hand
 void scrEngine::RegisterNativeHandler(uint64_t nativeIdentifier, NativeHandler handler)
 {
 	g_nativeHandlers.push_back(std::make_pair(nativeIdentifier, handler));
+}
+
+void scrEngine::ReviveNativeHandler(uint64_t nativeIdentifier, NativeHandler handler)
+{
+	RegisterNativeHandler(nativeIdentifier, handler);
+	if (MapNative(nativeIdentifier) == nativeIdentifier)
+	{
+		// If two builds share the same maxVersion index, e.g., 2545 and 2612,
+		// and a script command was removed, then the native may be found in the
+		// mapping table instead of the unmapped table.
+		ReviveNative(nativeIdentifier);
+	}
+}
+
+bool scrEngine::ShouldBlockNative(uint64_t hash)
+{
+	auto it = g_nativeBlockedBeforeBuild.find(hash);
+	return it != g_nativeBlockedBeforeBuild.end() && xbr::GetRequestedGameBuild() < it->second;
+}
+
+std::vector<uint64_t> scrEngine::GetBlockedNatives()
+{
+	std::vector<uint64_t> blockedNatives;
+	for (auto [hash, _]: g_nativeBlockedBeforeBuild)
+	{
+		if (scrEngine::ShouldBlockNative(hash))
+		{
+			blockedNatives.push_back(hash);
+		}
+	}
+	return blockedNatives;
+}
+
+bool scrEngine::GetStoryMode()
+{
+	return storyMode;
 }
 
 static InitFunction initFunction([] ()
@@ -421,10 +469,6 @@ static InitFunction initFunction([] ()
 			g_nativeHandlers.clear();
 		};
 
-		doReg();
-
-		PointerArgumentSafety();
-		g_fastPathMap.clear();
 		doReg();
 
 		for (auto& entry : g_onScriptInitQueue)
@@ -450,28 +494,7 @@ scrEngine::NativeHandler GetNativeHandlerDo(uint64_t origHash, uint64_t hash)
 			{
 				handler = (scrEngine::NativeHandler) /*DecodePointer(*/ table->handlers[i] /*)*/;
 				HandlerFilter(&handler);
-
-				if (handler)
-				{
-#define BLOCK_NATIVE(x) \
-	if (origHash == x) { \
-		static auto ogHandler = handler; \
-		handler = [](rage::scrNativeCallContext* cxt) { \
-			if (storyMode) return ogHandler(cxt); \
-			cxt->SetResult<uintptr_t>(0, 0); \
-		}; \
-	}
-
-					BLOCK_NATIVE(0x9BAE5AD2508DF078); // prop density lowering
-					BLOCK_NATIVE(0x5A5F40FE637EB584);
-					BLOCK_NATIVE(0xE80492A9AC099A93);
-					BLOCK_NATIVE(0x8EF07E15701D61ED);
-					BLOCK_NATIVE(0x933D6A9EEC1BACD0);
-					BLOCK_NATIVE(0x213AEB2B90CBA7AC);
-				}
-
 				g_fastPathMap[NativeHash{ origHash }] = handler;
-
 				break;
 			}
 		}
@@ -482,7 +505,7 @@ scrEngine::NativeHandler GetNativeHandlerDo(uint64_t origHash, uint64_t hash)
 
 scrEngine::NativeHandler GetNativeHandlerWrap(uint64_t origHash, uint64_t hash)
 {
-	return (Is372()) ? GetNativeHandlerDo<NativeRegistration_old>(origHash, hash) : GetNativeHandlerDo<NativeRegistration_obf>(origHash, hash);
+	return GetNativeHandlerDo<NativeRegistration_obf>(origHash, hash);
 }
 
 scrEngine::NativeHandler scrEngine::GetNativeHandler(uint64_t hash)
@@ -505,7 +528,7 @@ static int(*g_origReturnTrue)(void* a1, void* a2);
 
 static int ReturnTrueFromScript(void* a1, void* a2)
 {
-	if (Instance<ICoreGameInit>::Get()->HasVariable("storyMode"))
+	if (storyMode)
 	{
 		return g_origReturnTrue(a1, a2);
 	}
@@ -529,7 +552,7 @@ static int(*g_origNoScript)(void*, int);
 
 static int JustNoScript(GtaThread* thread, int a2)
 {
-	if (Instance<ICoreGameInit>::Get()->HasVariable("storyMode"))
+	if (storyMode)
 	{
 		return g_origNoScript(thread, a2);
 	}
@@ -557,48 +580,41 @@ static void StartupScriptWrap()
 	origStartupScript();
 }
 
-static InitFunction initFunction([]
-{
-	if (xbr::IsGameBuildOrGreater<2612>())
-	{
-		// IS_BIT_SET is missing in b2612+, re-adding for compatibility
-		rage::scrEngine::RegisterNativeHandler(0xE2D0C323A1AE5D85 /* 2545 hash */, [](rage::scrNativeCallContext* ctx)
-		{
-			bool result = false;
-
-			auto value = ctx->GetArgument<uint32_t>(0);
-			auto offset = ctx->GetArgument<int>(1);
-
-			if (offset < 32)
-			{
-				result = (value & (1 << offset)) != 0;
-			}
-
-			ctx->SetResult<int>(0, result);
-		});
-	}
-});
-
 static HookFunction hookFunction([] ()
 {
-	char* location = xbr::IsGameBuildOrGreater<2545>() ? hook::pattern("48 8B C8 EB 03 49 8B CD 48 8B 05").count(1).get(0).get<char>(11) : hook::pattern("48 8B C8 EB 03 48 8B CB 48 8B 05").count(1).get(0).get<char>(11);
+	Instance<ICoreGameInit>::Get()->OnSetVariable.Connect([](const std::string& name, bool value)
+	{
+		if (name == "storyMode")
+		{
+			storyMode = value;
+		}
+	});
+
+	char* location = nullptr;
+
+	if (xbr::IsGameBuildOrGreater<3258>())
+	{
+		location = hook::pattern("48 8B C8 EB ? 33 C9 48 8B 05").count(1).get(0).get<char>(10);
+	}
+	else if (xbr::IsGameBuildOrGreater<2545>())
+	{
+		location = hook::pattern("48 8B C8 EB 03 49 8B CD 48 8B 05").count(1).get(0).get<char>(11);
+	}
+	else
+	{
+		location = hook::pattern("48 8B C8 EB 03 48 8B CB 48 8B 05").count(1).get(0).get<char>(11);
+	}
 
 	scrThreadCollection = reinterpret_cast<decltype(scrThreadCollection)>(location + *(int32_t*)location + 4);
 
 	activeThreadTlsOffset = *hook::pattern("48 8B 04 D0 4A 8B 14 00 48 8B 01 F3 44 0F 2C 42 20").count(1).get(0).get<uint32_t>(-4);
 
-	if (Is372())
 	{
-		location = hook::pattern("FF 40 5C 8B 15 ? ? ? ? 48 8B").count(1).get(0).get<char>(5);
-		scrThreadId = reinterpret_cast<decltype(scrThreadId)>(location + *(int32_t*)location + 4);
-
-		location -= 9;
-
-		scrThreadCount = reinterpret_cast<decltype(scrThreadCount)>(location + *(int32_t*)location + 4);
-	}
-	else
-	{
-		if (xbr::IsGameBuildOrGreater<2612>())
+		if (xbr::IsGameBuildOrGreater<3258>())
+		{
+			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("8B 15 ? ? ? ? 48 8B 05 ? ? ? ? FF C2 89 15 ? ? ? ? 48 8B 0C F8", 2));
+		}
+		else if (xbr::IsGameBuildOrGreater<2612>())
 		{
 			scrThreadId = hook::get_address<uint32_t*>(hook::get_pattern("8B 15 ? ? ? ? 48 8B 05 ? ? ? ? FF C2 89 15 ? ? ? ? 48 8B 0C D8", 2));
 		}
@@ -617,17 +633,8 @@ static HookFunction hookFunction([] ()
 		}
 
 		location = xbr::IsGameBuildOrGreater<2545>() ? hook::get_pattern<char>("FF 0D ? ? ? ? 48 8B D9 75", 2) : hook::get_pattern<char>("FF 0D ? ? ? ? 48 8B F9", 2);
-
 		scrThreadCount = reinterpret_cast<decltype(scrThreadCount)>(location + *(int32_t*)location + 4);
-	}
 
-	if (Is372())
-	{
-		location = hook::pattern("76 61 49 8B 7A 40 48 8D 0D").count(1).get(0).get<char>(9);
-		registrationTable<NativeRegistration_old> = reinterpret_cast<decltype(registrationTable<NativeRegistration_old>)>(location + *(int32_t*)location + 4);
-	}
-	else
-	{
 		location = hook::pattern("76 32 48 8B 53 40").count(1).get(0).get<char>(9);
 		registrationTable<NativeRegistration_obf> = reinterpret_cast<decltype(registrationTable<NativeRegistration_obf>)>(location + *(int32_t*)location + 4);
 	}
@@ -645,7 +652,6 @@ static HookFunction hookFunction([] ()
 		MH_EnableHook(MH_ALL_HOOKS);
 	}
 
-	if (!CfxIsSinglePlayer())
 	{
 		MH_Initialize();
 

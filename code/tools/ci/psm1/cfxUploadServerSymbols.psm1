@@ -29,19 +29,11 @@ function Invoke-UploadServerSymbols {
 
     $pdbs = $pdbs.Where{ $_.BaseName -notin @("botan") }
 
-    workflow dump_pdb {
-        param(
-            [Object[]] $files,
-            [string] $dump_syms
-        )
-    
-        foreach -parallel -throttlelimit 10 ($pdb in $files) {
-            $outname = [io.path]::ChangeExtension($pdb.FullName, "sym")
-    
-            Start-Process $dump_syms -ArgumentList ($pdb.FullName) -RedirectStandardOutput $outname -Wait -WindowStyle Hidden
-        }
+    foreach ($pdb in $pdbs) {
+        $outname = [io.path]::ChangeExtension($pdb.FullName, "sym")
+
+        Start-Process $dump_syms -ArgumentList ($pdb.FullName) -RedirectStandardOutput $outname -Wait -WindowStyle Hidden
     }
-    dump_pdb -files $pdbs -dump_syms $dump_syms
 
     $syms = Get-ChildItem -Recurse -Filter "*.sym" -File ($Context.MSBuildOutput)
 
@@ -53,23 +45,27 @@ function Invoke-UploadServerSymbols {
 
     # chdir to the directory to avoid converting path to what rsync would expect
     Push-Location $symUploadDir
-        # remember current PATH content
-        $oldEnvPath = $env:PATH
-
-        # prepend PATH with MSYS2 bin dir so it can use it's own SSH
-        $msys2UsrBin = [IO.Path]::Combine($Tools.getMSYS2Root(), "usr\bin");
-        $env:PATH = "$msys2UsrBin;$env:PATH"
-
-        & $rsync -r -a -v -e $env:RSH_SYMBOLS_COMMAND ./ $env:SSH_SYMBOLS_TARGET
-        if ($LASTEXITCODE -ne 0) {
-            $Context.addBuildWarning("Failed to upload symbols, rsync failed")
+        if ($Context.IsDryRun) {
+            Write-Output "DRY RUN: Would upload symbols"
+        } else {
+            # remember current PATH content
+            $oldEnvPath = $env:PATH
+    
+            # prepend PATH with MSYS2 bin dir so it can use it's own SSH
+            $msys2UsrBin = [IO.Path]::Combine($Tools.getMSYS2Root(), "usr\bin");
+            $env:PATH = "$msys2UsrBin;$env:PATH"
+    
+            & $rsync -r -a -v -e $env:RSH_SYMBOLS_COMMAND ./ $env:SSH_SYMBOLS_TARGET
+            if ($LASTEXITCODE -ne 0) {
+                $Context.addBuildWarning("Failed to upload symbols, rsync failed")
+            }
+    
+            # restore PATH
+            $env:PATH = $oldEnvPath
         }
-
-        # restore PATH
-        $env:PATH = $oldEnvPath
     Pop-Location
 
-    if ($Context.IsReleaseBuild) {
+    if ($Context.IsPublicBuild) {
         Invoke-SentryUploadDif -Context $Context -Tools $Tools -Path $symPackDir
     }
 }

@@ -41,16 +41,17 @@ namespace CitizenFX.Core
 			return CoreNatives.DuplicateFunctionReference(m_reference);
 		}
 
+		[SecuritySafeCritical]
 		internal unsafe Coroutine<object> Invoke(object[] args)
 		{
-			object[] returnData = CoreNatives.InvokeFunctionReference(m_reference, args);
+			object[] returnData = MsgPackDeserializer.DeserializeArray(ScriptInterface.InvokeFunctionReference(m_reference, new InPacket(args).value));
 			if (returnData != null && returnData.Length > 0)
 			{
 				var result = returnData[0];
 
 				if (result is IDictionary<string, object> dict
-					&& dict.TryGetValue("__cfx_async_retval", out object requestAsyncCallback)
-					&& requestAsyncCallback is Callback callbackRequested)
+				    && dict.TryGetValue("__cfx_async_retval", out object requestAsyncCallback)
+				    && requestAsyncCallback is Callback callbackRequested)
 				{
 					var c = new Coroutine<object>();
 					callbackRequested(new Action<object, object>((results, exception) =>

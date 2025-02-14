@@ -3,41 +3,19 @@
 
 #include <jitasm.h>
 #include <Hooking.h>
-
 #include <MinHook.h>
+#include <PoolSizesState.h>
 
 #include <Error.h>
 
-class RageHashList
-{
-public:
-	template<int Size>
-	RageHashList(const char*(&list)[Size])
-	{
-		for (int i = 0; i < Size; i++)
-		{
-			m_lookupList.insert({ HashString(list[i]), list[i] });
-		}
-	}
+#include "CrossBuildRuntime.h"
 
-	inline std::string LookupHash(uint32_t hash)
-	{
-		auto it = m_lookupList.find(hash);
+#include "RageHashList.h"
 
-		if (it != m_lookupList.end())
-		{
-			return std::string(it->second);
-		}
 
-		return fmt::sprintf("0x%08x", hash);
-	}
-
-private:
-	std::map<uint32_t, std::string_view> m_lookupList;
-};
-
-static std::map<uint32_t, atPoolBase*> g_pools;
-static std::map<atPoolBase*, uint32_t> g_inversePools;
+static std::unordered_map<uint32_t, atPoolBase*> g_pools;
+static std::unordered_map<atPoolBase*, uint32_t> g_inversePools;
+static std::unordered_map<std::string, atPoolBase*> g_namedPools;
 
 static const char* poolEntriesTable[] = {
 	"AnimatedBuilding",
@@ -190,11 +168,20 @@ static const char* poolEntriesTable[] = {
 	"OcclusionPortalInfo",
 #include "gta_vtables.h"
 	"Decorator",
+	"StreamPed req data",
+	"StreamPed render data",
+	"CChatHelper",
+	"Landing gear parts",
+	"PedProp render data",
+	"PedProp req data",
+	"camStickyAimHelper",
+	"Entity Alt request data",
+	"TextStore",
 };
 
 static RageHashList poolEntries(poolEntriesTable);
 
-GTA_CORE_EXPORT atPoolBase* rage::GetPoolBase(uint32_t hash)
+atPoolBase* rage::GetPoolBase(uint32_t hash)
 {
 	auto it = g_pools.find(hash);
 
@@ -206,10 +193,16 @@ GTA_CORE_EXPORT atPoolBase* rage::GetPoolBase(uint32_t hash)
 	return it->second;
 }
 
+const std::unordered_map<std::string, atPoolBase*>& rage::GetPools()
+{
+	return g_namedPools;
+}
+
 static atPoolBase* SetPoolFn(atPoolBase* pool, uint32_t hash)
 {
 	g_pools[hash] = pool;
 	g_inversePools.insert({ pool, hash });
+	g_namedPools[poolEntries.LookupHash(hash)] = pool;
 
 	return pool;
 }
@@ -226,6 +219,7 @@ static void PoolDtorWrap(atPoolBase* pool)
 
 		g_pools.erase(hash);
 		g_inversePools.erase(pool);
+		g_namedPools.erase(poolEntries.LookupHash(hash));
 	}
 
 	return g_origPoolDtor(pool);
@@ -375,6 +369,46 @@ static void* GetNetObjPositionWrap(void* a1, void* a2)
 	return g_origGetNetObjPosition(a1, a2);
 }
 
+int64_t(*g_origGetSizeOfPool)(void*, uint32_t, int);
+
+static int64_t GetSizeOfPool(void* configManager, uint32_t poolHash, int defaultSize)
+{
+	int64_t size = g_origGetSizeOfPool(configManager, poolHash, defaultSize);
+
+	auto sizeIncreaseEntry = fx::PoolSizeManager::GetIncreaseRequest().find(poolEntries.LookupHash(poolHash));
+	if (sizeIncreaseEntry != fx::PoolSizeManager::GetIncreaseRequest().end())
+	{
+		size += sizeIncreaseEntry->second;
+	}
+
+	return size;
+}
+
+static void (*g_orig_fwDescPoolInit)(void* self, uint32_t nMaxEntries, uint32_t nAlignment, uint32_t membucketId);
+
+static void fwDescPoolInit(void* self, uint32_t nMaxEntries, uint32_t nAlignment, uint32_t membucketId)
+{
+	auto sizeIncreaseEntry = fx::PoolSizeManager::GetIncreaseRequest().find("EntityDescPool");
+	if (sizeIncreaseEntry != fx::PoolSizeManager::GetIncreaseRequest().end())
+	{
+		nMaxEntries += sizeIncreaseEntry->second;
+	}
+	return g_orig_fwDescPoolInit(self, nMaxEntries, nAlignment, membucketId);
+}
+
+static hook::cdecl_stub<void()> fwBaseEntityContainer_UpdateDataHandleCacheForAll([]()
+{
+	return hook::get_pattern("48 89 5C 24 ? 57 48 83 EC ? 48 8B 3D ? ? ? ? 33 DB 44 8B 4F");
+});
+
+static void (*g_orig_fwDescPool_DefragFull)(void* self);
+
+static void fwDescPool_DefragFull(void* self)
+{
+	g_orig_fwDescPool_DefragFull(self);
+	fwBaseEntityContainer_UpdateDataHandleCacheForAll();
+}
+
 static HookFunction hookFunction([] ()
 {
 	auto generateAndCallStub = [](hook::pattern_match match, int callOffset, uint32_t hash, bool isAssetStore)
@@ -463,7 +497,27 @@ static HookFunction hookFunction([] ()
 	// cloning stuff
 	MH_CreateHook(hook::get_pattern("41 8B D9 41 8A E8 4C 8B F2 48 8B F9", -0x19), ShouldWriteToPlayerWrap, (void**)&g_origShouldWriteToPlayer);
 
-	MH_CreateHook(hook::get_pattern("41 8A E8 48 8B DA 48 85 D2 0F", -0x1E), GetRelevantSectorPosPlayersWrap, (void**)&g_origGetRelevantSectorPosPlayers);
+	if (xbr::IsGameBuildOrGreater<3095>())
+	{
+		MH_CreateHook(hook::get_pattern("45 8A F8 48 8B DA 48 85 D2 0F", -0x1E), GetRelevantSectorPosPlayersWrap, (void**)&g_origGetRelevantSectorPosPlayers);
+	}
+	else
+	{
+		MH_CreateHook(hook::get_pattern("41 8A E8 48 8B DA 48 85 D2 0F", -0x1E), GetRelevantSectorPosPlayersWrap, (void**)&g_origGetRelevantSectorPosPlayers);
+	}
+
+	MH_CreateHook(hook::get_pattern("45 33 DB 44 8B D2 66 44 39 59 ? 74 ? 44 0F B7 49 ? 33 D2 41 8B C2 41 F7 F1 48 8B 41 ? 48 8B 0C D0 EB ? 44 3B 11 74 ? 48 8B 49"), GetSizeOfPool, (void**)&g_origGetSizeOfPool);
+
+	// ms_entityDescPool ("EntityDescPool") is different from the rest. Hook it's initialization separately so we can increase it's size by request.
+	// The pool is not added to g_namedPools and therefore not visible in pool monitor.
+	// This is because ms_entityDescPool doesn't have explicit data about entity count. Instead it stores list of gaps / free spaces.
+	// We could patch it up to track the entity count, but it's not clear that the added complexity is worth the benefit.
+	MH_CreateHook(hook::get_pattern("40 53 48 83 EC ? 89 11 33 C0"), fwDescPoolInit, (void**)&g_orig_fwDescPoolInit);
+
+	// When ms_entityDescPool is defragmented sometimes the base game is not fast enough to update the data handlers pointers. Which leads to memory access violation and crash.
+	// Force update of the data handlers cache after each full defragmentation.
+	// Full defragmentation only happens when server is reaching limits of ms_entityDescPool. Which is rare. So this patch should not cause any performance issues.
+	MH_CreateHook(hook::get_pattern("48 89 5C 24 ? 57 48 83 EC ? 48 8B D9 0F B7 7B"), fwDescPool_DefragFull, (void**)&g_orig_fwDescPool_DefragFull);
 
 	//MH_CreateHook((void*)0x14159A8F0, AssignObjectIdWrap, (void**)&g_origAssignObjectId);
 

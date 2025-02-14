@@ -1,11 +1,11 @@
 #include <StdInc.h>
-#include <ScriptEngine.h>
 
+#include <ScriptEngine.h>
 #include <ScriptSerialization.h>
 #include <NetworkPlayerMgr.h>
 #include <scrEngine.h>
-
 #include <Hooking.h>
+#include "EntitySystem.h"
 
 static int(*netInterface_GetNumPhysicalPlayers)();
 static CNetGamePlayer** (*netInterface_GetAllPhysicalPlayers)();
@@ -29,7 +29,7 @@ static void* getAndCheckPlayerInfo(fx::ScriptContext& context)
 		return nullptr;
 	}
 
-	return player->playerInfo();
+	return player->GetPlayerInfo();
 }
 
 template<typename T, int* offset>
@@ -56,7 +56,7 @@ static int PlayerMaxStaminaOffset;
 
 static HookFunction hookFunction([]()
 {
-	WeaponDamageModifierOffset = *hook::get_pattern<int>("F3 41 0F 59 85 ? ? ? ? 74 ? 48 8B 83", 0x16);
+	WeaponDamageModifierOffset = *hook::get_pattern<int>("F3 0F 10 88 ? ? ? ? EB ? 41 0F 28 CA", 4);
 	WeaponDefenseModifierOffset = *hook::get_pattern<int>("F3 0F 11 80 ? ? ? ? F3 0F 10 87 ? ? ? ? 48", 0x4);
 	VehicleDamageModifierOffset = *hook::get_pattern<int>("74 ? 48 8B 80 ? ? ? ? F3 44 0F 59 88", 0xE);
 	VehicleDefenseModifierOffset = *hook::get_pattern<int>("F6 C1 ? 75 ? 48 8B 83 ? ? ? ? 48 8B 4E", 0x13);
@@ -119,15 +119,14 @@ static HookFunction hookFunction([]()
 	{
 		bool result = false;
 
-		void* playerInfo = getAndCheckPlayerInfo(context);
-
-		if (playerInfo)
+		if (void* playerInfo = getAndCheckPlayerInfo(context))
 		{
 			float newStamina = context.GetArgument<float>(1);
-			float maxStamina = *((float*)((char*)playerInfo + PlayerMaxStaminaOffset));
-			if (newStamina && newStamina <= maxStamina)
+			float maxStamina = *(float*)((char*)playerInfo + PlayerMaxStaminaOffset);
+
+			if (newStamina <= maxStamina)
 			{
-				*((float*)((char*)playerInfo + PlayerStaminaOffset)) = newStamina;
+				*(float*)((char*)playerInfo + PlayerStaminaOffset) = newStamina;
 				result = true;
 			}
 		}
@@ -139,14 +138,12 @@ static HookFunction hookFunction([]()
 	{
 		bool result = false;
 
-		void* playerInfo = getAndCheckPlayerInfo(context);
-
-		if (playerInfo)
+		if (void* playerInfo = getAndCheckPlayerInfo(context))
 		{
 			float newMaxStamina = context.GetArgument<float>(1);
-			if (newMaxStamina && newMaxStamina > 0.0)
+			if (newMaxStamina > 0.0)
 			{
-				*((float*)((char*)playerInfo + PlayerMaxStaminaOffset)) = newMaxStamina;
+				*(float*)((char*)playerInfo + PlayerMaxStaminaOffset) = newMaxStamina;
 				result = true;
 			}
 		}

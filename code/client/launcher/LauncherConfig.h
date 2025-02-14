@@ -7,8 +7,9 @@
 
 #pragma once
 
-#define CONTENT_URL "https://content.cfx.re/updates"
-#define CONTENT_URL_WIDE L"https://content.cfx.re/updates"
+#ifndef CFX_UPDATER_URL
+#define CFX_UPDATER_URL "https://content.cfx.re/updates"
+#endif
 
 #if defined(GTA_NY)
 #define PRODUCT_NAME L"LibertyM"
@@ -25,10 +26,12 @@
 #define PRODUCT_NAME L"FiveM"
 #define GAME_EXECUTABLE L"GTA5.exe"
 #define CONTENT_NAME "fivereborn"
+#define LINK_PROTOCOL L"fivem"
 #elif defined(IS_RDR3)
 #define PRODUCT_NAME L"RedM"
 #define CONTENT_NAME "redm"
 #define GAME_EXECUTABLE L"RDR2.exe"
+#define LINK_PROTOCOL L"redm"
 #elif defined(IS_LAUNCHER)
 #define PRODUCT_NAME L"Cfx.re Launcher"
 #define GAME_EXECUTABLE L"DUMMY.exe"

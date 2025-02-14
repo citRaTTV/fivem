@@ -237,6 +237,14 @@ struct ControlClass2699
 	uint32_t numKeys;
 };
 
+struct ControlClass3095
+{
+	// 3095 (+32)
+	uint8_t pad[2544 + 32];
+
+	KeyLayoutMap keys[255];
+	uint32_t numKeys;
+};
 
 static void(*g_origLoadLayout)(void*);
 
@@ -285,7 +293,11 @@ static void OnInputLanguageChange()
 
 	if (g_controlData)
 	{
-		if (xbr::IsGameBuildOrGreater<2699>())
+		if (xbr::IsGameBuildOrGreater<3095>())
+		{
+			UpdateControlData((ControlClass3095*)g_controlData);
+		}
+		else if (xbr::IsGameBuildOrGreater<2699>())
 		{
 			UpdateControlData((ControlClass2699*)g_controlData);
 		}
@@ -302,11 +314,6 @@ static void OnInputLanguageChange()
 
 static HookFunction hookFunction([]()
 {
-	if (Is372())
-	{
-		return;
-	}
-
 	{
 		// Disable loading of en-US layout in _initKeyboard, we tap into kbdus directly
 		auto enKeyboardInitBlock = hook::get_pattern<uint8_t>("40 8A C6 48 39 35 ? ? ? ? 75 08 84 C0 0F 84 ? ? ? ? 33 D2 33 C9", 3);
@@ -321,7 +328,7 @@ static HookFunction hookFunction([]()
 	{
 		auto location = hook::get_pattern("E8 ? ? ? ? 48 8D 45 88 48 3B D8 74 1E");
 		hook::set_call(&g_origLoadLayout, location);
-		hook::call(location, (xbr::IsGameBuildOrGreater<2699>() ? (void*)&LoadKeyboardLayoutWrap<ControlClass2699> : xbr::IsGameBuildOrGreater<2060>() ? (void*)&LoadKeyboardLayoutWrap<ControlClass2060> : (void*)&LoadKeyboardLayoutWrap<ControlClass1604>));
+		hook::call(location, (xbr::IsGameBuildOrGreater<3095>() ? (void*)&LoadKeyboardLayoutWrap<ControlClass3095> : xbr::IsGameBuildOrGreater<2699>() ? (void*)&LoadKeyboardLayoutWrap<ControlClass2699> : xbr::IsGameBuildOrGreater<2060>() ? (void*)&LoadKeyboardLayoutWrap<ControlClass2060> : (void*)&LoadKeyboardLayoutWrap<ControlClass1604>));
 	}
 
 	{

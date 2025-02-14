@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <variant>
+#include <charconv>
 
 #include <tbb/concurrent_unordered_map.h>
 
@@ -258,7 +259,7 @@ std::shared_ptr<RcdStream> ResourceCacheDeviceV2::OpenStream(const std::string& 
 	return std::make_shared<RcdStream>(static_cast<RcdFetcher*>(this), fileName);
 }
 
-std::shared_ptr<RcdStream> ResourceCacheDeviceV2::CreateStream(const std::string& fileName)
+std::shared_ptr<RcdStream> ResourceCacheDeviceV2::CreateStream(const std::string& fileName, bool createIfExists)
 {
 	return {};
 }
@@ -287,7 +288,12 @@ size_t ResourceCacheDeviceV2::GetRealSize(const ResourceCacheEntryList::Entry& e
 
 		if (auto it = extData.find("rawSize"); it != extData.end())
 		{
-			realSize = std::stoi(it->second);
+			auto& str = it->second;
+			if (std::from_chars(str.data(), str.data() + str.size(), realSize).ec != std::errc())
+			{
+				trace(__FUNCTION__ ": could not parse rawSize: %s\n", str);
+				realSize = 0;
+			}
 		}
 	}
 

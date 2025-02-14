@@ -6,6 +6,7 @@
  */
 
 #include "StdInc.h"
+
 #include <ScriptEngine.h>
 
 #include <ResourceManager.h>
@@ -13,12 +14,14 @@
 
 #include <VFSManager.h>
 
+#include "FilesystemPermissions.h"
+
 #if __has_include(<CrossBuildRuntime.h>) && defined(_WIN32)
 #include <CrossBuildRuntime.h>
 
 static inline auto GetGameBuild()
 {
-	return xbr::GetGameBuild();
+	return xbr::GetRequestedGameBuild();
 }
 #else
 static inline auto GetGameBuild()
@@ -170,15 +173,21 @@ static InitFunction initFunction([] ()
 		// find the resource
 		fx::ResourceManager* resourceManager = fx::ResourceManager::GetCurrent();
 		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
-
+	
 		if (!resource.GetRef())
 		{
 			context.SetResult(nullptr);
 			return;
 		}
 
+		if (!fx::ScriptingFilesystemAllowWrite("@" + resource->GetName() + "/" + context.CheckArgument<const char*>(1)))
+		{
+			context.SetResult(nullptr);
+			return;
+		}
+
 		// try opening a writable file in the resource's home directory
-		std::string filePath = resource->GetPath() + "/" + context.CheckArgument<const char*>(1);
+		const std::string filePath = resource->GetPath() + "/" + context.CheckArgument<const char*>(1);
 
 		fwRefContainer<vfs::Device> device = vfs::GetDevice(filePath);
 		auto handle = device->Create(filePath);

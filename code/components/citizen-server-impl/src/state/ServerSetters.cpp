@@ -96,7 +96,7 @@ std::shared_ptr<sync::SyncTreeBase> MakeAutomobile(uint32_t model, float posX, f
 		cdn.m_randomSeed = rand();
 		cdn.m_tyresDontBurst = false;
 		cdn.m_vehicleStatus = 2;
-		cdn.m_unk5 = false;
+		cdn.m_usesSpecialFlightMode = false;
 	});
 
 	SetupNode(tree, [](sync::CAutomobileCreationDataNode& cdn)
@@ -131,7 +131,7 @@ std::shared_ptr<sync::SyncTreeBase> MakeVehicle(uint32_t model, float posX, floa
 		cdn.m_randomSeed = rand();
 		cdn.m_tyresDontBurst = false;
 		cdn.m_vehicleStatus = 2;
-		cdn.m_unk5 = false;
+		cdn.m_usesSpecialFlightMode = false;
 	});
 
 	if constexpr (std::is_same_v<TTree, sync::CAutomobileSyncTree> ||
@@ -210,7 +210,7 @@ std::shared_ptr<sync::SyncTreeBase> MakeObject(uint32_t model, float posX, float
 		cdn.m_hasInitPhysics = dynamic;
 	});
 
-	SetupNode(tree, [resourceHash](sync::CObjectSectorPosNode& cdn)
+	SetupNode(tree, [](sync::CObjectSectorPosNode& cdn)
 	{
 		cdn.highRes = true;
 	});
@@ -223,6 +223,12 @@ std::shared_ptr<sync::SyncTreeBase> MakeObject(uint32_t model, float posX, float
 
 		glm::quat q = glm::quat(glm::vec3(0.0f, 0.0f, heading * 0.01745329252f));
 		node.data.quat.Load(q.x, q.y, q.z, q.w);
+	});
+
+	SetupNode(tree, [](sync::CGlobalFlagsDataNode& node)
+	{
+		node.globalFlags = 4;
+		node.token = 0;
 	});
 
 	SetupNode(tree, [resourceHash](sync::CEntityScriptInfoDataNode& cdn)
@@ -324,7 +330,14 @@ static InitFunction initFunction([]()
 			auto sgs = ref->GetComponent<fx::ServerGameState>();
 			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Automobile, tree);
 
-			ctx.SetResult(sgs->MakeScriptHandle(entity));
+			uint32_t guid = 0;
+
+			if (entity)
+			{
+				guid = sgs->MakeScriptHandle(entity);
+			}
+
+			ctx.SetResult(guid);
 		});
 
 		fx::ScriptEngine::RegisterNativeHandler("CREATE_VEHICLE_SERVER_SETTER", [ref](fx::ScriptContext& ctx)
@@ -420,7 +433,14 @@ static InitFunction initFunction([]()
 			auto sgs = ref->GetComponent<fx::ServerGameState>();
 			auto entity = sgs->CreateEntityFromTree(typeId, tree);
 
-			ctx.SetResult(sgs->MakeScriptHandle(entity));
+			uint32_t guid = 0;
+
+			if (entity)
+			{
+				guid = sgs->MakeScriptHandle(entity);
+			}
+
+			ctx.SetResult(guid);
 		});
 
 		fx::ScriptEngine::RegisterNativeHandler("CREATE_PED", [=](fx::ScriptContext& ctx)
@@ -444,7 +464,14 @@ static InitFunction initFunction([]()
 			auto sgs = ref->GetComponent<fx::ServerGameState>();
 			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Ped, tree);
 
-			ctx.SetResult(sgs->MakeScriptHandle(entity));
+			uint32_t guid = 0;
+
+			if (entity)
+			{
+				guid = sgs->MakeScriptHandle(entity);
+			}
+
+			ctx.SetResult(guid);
 		});
 
 		fx::ScriptEngine::RegisterNativeHandler("CREATE_OBJECT_NO_OFFSET", [=](fx::ScriptContext& ctx)
@@ -468,7 +495,14 @@ static InitFunction initFunction([]()
 			auto sgs = ref->GetComponent<fx::ServerGameState>();
 			auto entity = sgs->CreateEntityFromTree(sync::NetObjEntityType::Object, tree);
 
-			ctx.SetResult(sgs->MakeScriptHandle(entity));
+			uint32_t guid = 0;
+
+			if (entity)
+			{
+				guid = sgs->MakeScriptHandle(entity);
+			}
+
+			ctx.SetResult(guid);
 		});
 	});
 });

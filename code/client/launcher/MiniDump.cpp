@@ -16,6 +16,7 @@
 #include <client/windows/crash_generation/crash_generation_server.h>
 #include <common/windows/http_upload.h>
 
+#include <CfxSentry.h>
 #include <CfxLocale.h>
 #include <CfxState.h>
 #include <CfxSubProcess.h>
@@ -50,6 +51,18 @@ struct ExceptionBuffer
 	char data[4096];
 };
 
+struct ExtraExceptionInfo
+{
+	size_t dataSize;
+	char data[0];
+};
+
+extern "C" 
+{
+DLL_EXPORT ExtraExceptionInfo* g_extraExceptionInfo = nullptr;
+DLL_EXPORT bool g_accessDeathFriendlyMessage = false;
+}
+
 using json = nlohmann::json;
 
 static json load_json_file(const std::wstring& path)
@@ -81,38 +94,24 @@ static json load_json_file(const std::wstring& path)
 
 static void send_sentry_session(const json& data)
 {
-	constexpr int sentryProjectId =
-#ifndef IS_RDR3
-	2
-#else
-	11
-#endif
-	;
-
-	constexpr std::string_view sentryKey =
-#ifndef IS_RDR3
-	"9902acf744d546e98ca357203f19278b"
-#else
-	"22f37206f3a64544bbd9b3ca9c5c2891"
-#endif
-	;
-
+#ifdef CFX_SENTRY_USE_SESSION
 	std::stringstream bodyData;
 	bodyData << "{}\n";
 	bodyData << R"({"type":"session"})" << "\n";
 	bodyData << data.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace) << "\n";
 
 	auto r = cpr::Post(
-	cpr::Url{ fmt::sprintf("https://sentry.fivem.net/api/%d/envelope/", sentryProjectId) },
-	cpr::Body{bodyData.str()},
+	cpr::Url{ CFX_SENTRY_SESSION_URL },
+	cpr::Body{ bodyData.str() },
 	cpr::VerifySsl{ false },
 	cpr::Header{
 		{
 			"X-Sentry-Auth",
-			fmt::sprintf("Sentry sentry_version=7, sentry_key=%s", sentryKey)
+			fmt::sprintf("Sentry sentry_version=7, sentry_key=%s", CFX_SENTRY_SESSION_KEY)
 		}
 	},
 	cpr::Timeout{ 2500 });
+#endif
 }
 
 std::string g_entitlementSource;
@@ -1185,7 +1184,9 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 				auto crashometry = load_crashometry();
 
 				parameters[L"Product"] = PRODUCT_NAME;
-				parameters[L"GameBuild"] = fmt::sprintf(L"%d", xbr::GetGameBuild());
+
+				parameters[L"GameBuild"] = ToWide(xbr::GetCurrentGameBuildString());
+
 				parameters[L"ReleaseChannel"] = ToWide(GetUpdateChannel());
 
 				parameters[L"AdditionalData"] = GetAdditionalData();
@@ -1379,9 +1380,27 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 				if (isAccessDeath)
 				{
-					windowTitle = L"Fatal Error";
-					mainInstruction = L"Early-exit trap";
-					content = fmt::sprintf(L"A problem while running %s has tripped an early-exit trap.\n\nIf asking for support, please provide a readable 'report ID' from the expanded information below.", PRODUCT_NAME);
+					if (!g_accessDeathFriendlyMessage)
+					{
+						windowTitle = L"Fatal Error";
+						mainInstruction = L"Early-exit trap";
+						content = fmt::sprintf(L"A problem while running %s has tripped an early-exit trap.\n\nIf asking for support, please provide a readable 'report ID' from the expanded information below.", PRODUCT_NAME);
+					}
+					else
+					{
+						windowTitle = PRODUCT_NAME L" encountered an error";
+						mainInstruction = L"Game integrity check failed";
+						content = L"A " PRODUCT_NAME L" integrity check failed and the game had to be terminated.\nThis may be caused by recent changes made to your computer, please read this <A HREF=\"https://aka.cfx.re/integrity-check-failed\">support article</A> for more information.";
+					}
+
+					if (g_extraExceptionInfo)
+					{
+						std::string extraData = "Additional diagnostic information:\n";
+						extraData.append(&g_extraExceptionInfo->data[0], g_extraExceptionInfo->dataSize);
+
+						content = fmt::sprintf(L"%s\n\n%s", content, ToWide(extraData));
+					}
+
 				}
 
 				if (shouldTerminate)
@@ -1636,8 +1655,8 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 				parameters[L"Fatal"] = (shouldTerminate) ? L"true" : L"false";
 
 				// upload the actual minidump file as well
-#if defined(GTA_FIVE) || defined(IS_RDR3)
-				if (uploadCrashes && shouldUpload && HTTPUpload::SendMultipartPostRequest(L"https://crash-ingress.fivem.net/post", parameters, files, &timeout, &responseBody, &responseCode))
+#if defined(CFX_CRASH_INGRESS_URL) && (defined(GTA_FIVE) || defined(IS_RDR3))
+				if (uploadCrashes && shouldUpload && HTTPUpload::SendMultipartPostRequest(va(L"%s/post", ToWide(CFX_CRASH_INGRESS_URL)), parameters, files, &timeout, &responseBody, &responseCode))
 				{
 					trace("Crash report service returned %s\n", ToNarrow(responseBody));
 					crashId = responseBody;

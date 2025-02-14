@@ -1,15 +1,11 @@
 #pragma once
 
+#include <ForceConsteval.h>
+
 namespace fx
 {
 	namespace ServerDecorators
 	{
-		template<uint32_t I>
-		inline uint32_t const_uint32()
-		{
-			return I;
-		}
-
 		template<typename... THandler>
 		const fwRefContainer<fx::GameServer>& WithPacketHandler(const fwRefContainer<fx::GameServer>& server)
 		{
@@ -18,16 +14,17 @@ namespace fx
 			// store the handler map
 			HandlerMapComponent* map = server->GetComponent<HandlerMapComponent>().GetRef();
 
-			server->SetPacketHandler([=](uint32_t packetId, const fx::ClientSharedPtr& client, net::Buffer& packet)
+			server->SetPacketHandler([=](uint32_t packetId, const fx::ClientSharedPtr& client, net::ByteReader& reader, ENetPacketPtr& packet)
 			{
 				bool handled = false;
 
 				// any fast-path handlers?
-				([&]
+				([&server, &handled, packetId, &client, &reader, &packet]
 				{
-					if (!handled && packetId == const_uint32<HashRageString(THandler::GetPacketId())>())
+					if (!handled && packetId == THandler::PacketType)
 					{
-						THandler::Handle(server->GetInstance(), client, packet);
+						static THandler handler (server->GetInstance());
+						handler.Process(server->GetInstance(), client, reader, packet);
 						handled = true;
 					}
 				}(), ...);
@@ -39,11 +36,13 @@ namespace fx
 
 					if (entry)
 					{
-						auto cb = [client, entry, packet]() mutable
+						const uint64_t offset = reader.GetOffset();
+						auto cb = [client, entry, offset, packet]
 						{
 							auto scope = client->EnterPrincipalScope();
-
-							std::get<1>(*entry)(client, packet);
+							net::ByteReader movedReader (packet->data, packet->dataLength);
+							movedReader.Seek(offset);
+							std::get<1>(*entry)(client, movedReader, packet);
 						};
 
 						switch (std::get<fx::ThreadIdx>(*entry))
@@ -52,7 +51,7 @@ namespace fx
 							gscomms_execute_callback_on_main_thread(cb);
 							break;
 						case fx::ThreadIdx::Net:
-							gscomms_execute_callback_on_net_thread(cb);
+							cb();
 							break;
 						case fx::ThreadIdx::Sync:
 							gscomms_execute_callback_on_sync_thread(cb);

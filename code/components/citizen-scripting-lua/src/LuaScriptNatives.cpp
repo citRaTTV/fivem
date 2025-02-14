@@ -7,11 +7,6 @@
 
 #include "StdInc.h"
 
-#if defined(_DEBUG) || defined(BUILD_LUA_SCRIPT_NATIVES)
-#if __has_include(<PointerArgumentHints.h>)
-#include <PointerArgumentHints.h>
-#endif
-
 #include <fxScripting.h>
 #include <Error.h>
 
@@ -37,82 +32,215 @@ extern LUA_INTERNAL_LINKAGE
 #endif
 }
 
-// @TODO: Technically unsafe
-extern uint8_t g_metaFields[];
+using namespace fx::invoker;
 
-extern uint64_t g_tickTime;
 extern bool g_hadProfiler;
 
-/// <summary>
-/// </summary>
-template<bool IsPtr>
-static int Lua_PushContextArgument(lua_State* L, int idx, fxLuaNativeContext<IsPtr>& context, fxLuaResult& result);
-
-/// <summary>
-/// Pushing function
-/// </summary>
-template<bool IsPtr, typename T>
-static LUA_INLINE void fxLuaNativeContext_PushArgument(fxLuaNativeContext<IsPtr>& context, T value)
+// Get the pointer to a value local to the current lua function (idx must be > 0)
+static CSCRC_INLINE const TValue* LuaGetLocal(lua_State* L, int idx)
 {
-	using TVal = std::decay_t<decltype(value)>;
-	const int na = context.numArguments;
-
-	if (context.numArguments >= std::size(context.arguments))
-	{
-		return;
-	}
-
-	LUA_IF_CONSTEXPR(sizeof(TVal) < sizeof(uintptr_t))
-	{
-		LUA_IF_CONSTEXPR(std::is_integral_v<TVal>)
-		{
-			LUA_IF_CONSTEXPR(std::is_signed_v<TVal>)
-			{
-				*reinterpret_cast<uintptr_t*>(&context.arguments[na]) = (uintptr_t)(uint32_t)value;
-			}
-			else
-			{
-				*reinterpret_cast<uintptr_t*>(&context.arguments[na]) = (uintptr_t)value;
-			}
-		}
-		else
-		{
-			*reinterpret_cast<uintptr_t*>(&context.arguments[na]) = *reinterpret_cast<const uint32_t*>(&value);
-		}
-	}
-	else
-	{
-		*reinterpret_cast<TVal*>(&context.arguments[na]) = value;
-	}
-
-	context.numArguments = na + 1;
+#if LUA_VERSION_NUM == 504
+	const CallInfo* ci = L->ci;
+	const StkId o = ci->func + idx;
+	api_check(L, idx <= ci->top - (ci->func + 1), "unacceptable index");
+	return (o >= L->top) ? &G(L)->nilvalue : s2v(o);
+#else
+	const CallInfo* ci = L->ci;
+	const TValue* o = ci->func + idx;
+	api_check(L, idx <= ci->top - (ci->func + 1), "unacceptable index");
+	return (o >= L->top) ? luaO_nilobject : o;
+#endif
 }
 
-template<bool IsPtr>
-static LUA_INLINE int fxLuaNativeContext_PushPointer(lua_State* L, fxLuaNativeContext<IsPtr>& context, fxLuaResult& result, LuaMetaFields metaField)
+struct LuaScriptNativeContext final : ScriptNativeContext
 {
-	if (result.numReturnValues >= std::size(result.retvals))
+	LuaScriptNativeContext(lua_State* L, const ScriptNativeHandler& handler);
+
+	void PushArgument(int idx);
+	void PushTableArgument(int idx);
+
+	template<typename T>
+	void ProcessResult(T value);
+
+	lua_State* const L;
+};
+
+LuaScriptNativeContext::LuaScriptNativeContext(lua_State* L, const ScriptNativeHandler& handler)
+	: ScriptNativeContext(handler), L(L)
+{
+}
+
+CSCRC_INLINE void LuaScriptNativeContext::PushArgument(int idx)
+{
+	const TValue* value = LuaGetLocal(L, idx);
+	size_t slot = ReserveArgs(1); // Check we can push at least 1 argument
+
+#if LUA_VERSION_NUM == 504
+	switch (ttypetag(value))
 	{
-		lua_pushliteral(L, "too many return value arguments");
-		return lua_error(L);
+		case LUA_VNIL:
+		case LUA_VFALSE:
+			PushAt(slot, 0);
+			break;
+
+		case LUA_VTRUE:
+			PushAt(slot, 1);
+			break;
+
+		case LUA_VNUMINT:
+			PushAt(slot, ivalue(value));
+			break;
+
+		case LUA_VNUMFLT:
+			PushAt(slot, fltvalue(value));
+			break;
+
+		case LUA_VSHRSTR:
+#if defined(GRIT_POWER_BLOB)
+		case LUA_VBLOBSTR:
+#endif
+		case LUA_VLNGSTR:
+			PushAt(slot, svalue(value), vslen(value));
+			break;
+
+		case LUA_VVECTOR2:
+		{
+			slot = ReserveArgs(2);
+			const auto& v = vvalue(value);
+			PushAt(slot + 0, v.v4.x);
+			PushAt(slot + 1, v.v4.y);
+			break;
+		}
+
+		case LUA_VVECTOR3:
+		{
+			slot = ReserveArgs(3);
+			const auto& v = vvalue(value);
+			PushAt(slot + 0, v.v4.x);
+			PushAt(slot + 1, v.v4.y);
+			PushAt(slot + 2, v.v4.z);
+			break;
+		}
+
+		case LUA_VVECTOR4:
+		{
+			slot = ReserveArgs(4);
+			const auto& v = vvalue(value);
+			PushAt(slot + 0, v.v4.x);
+			PushAt(slot + 1, v.v4.y);
+			PushAt(slot + 2, v.v4.z);
+			PushAt(slot + 3, v.v4.w);
+			break;
+		}
+
+		case LUA_VQUAT: // Support (NOT) GLM_FORCE_QUAT_DATA_XYZW
+		{
+			slot = ReserveArgs(4);
+			const auto& v = vvalue(value);
+			PushAt(slot + 0, v.q.x);
+			PushAt(slot + 1, v.q.y);
+			PushAt(slot + 2, v.q.z);
+			PushAt(slot + 3, v.q.w);
+			break;
+		}
+
+		case LUA_VTABLE: // table (high-level class with __data field)
+			PushTableArgument(idx);
+			break;
+
+		case LUA_VLIGHTUSERDATA:
+			PushMetaPointer(static_cast<uint8_t*>(pvalue(value)));
+			break;
+
+		default:
+		{
+			ScriptErrorf("invalid lua type: %s", lua_typename(L, ttype(value)));
+		}
 	}
+#else
+	switch (ttype(value))
+	{
+		case LUA_TNIL:
+			PushAt(slot, 0);
+			break;
 
-	// push the offset and set the type
-	fxLuaNativeContext_PushArgument(context, &result.retvals[result.numReturnValues]);
-	result.rettypes[result.numReturnValues] = metaField;
+		case LUA_TBOOLEAN:
+			PushAt(slot, bvalue(value));
+			break;
 
-	// increment the counter
-	if (metaField == LuaMetaFields::PointerValueVector)
-		result.numReturnValues += 3;
-	else
-		result.numReturnValues += 1;
+		case LUA_TNUMINT:
+			PushAt(slot, ivalue(value));
+			break;
 
-	return 1;
+		case LUA_TNUMFLT:
+			PushAt(slot, fltvalue(value));
+			break;
+
+		case LUA_TSHRSTR:
+			PushAt(slot, svalue(value), tsvalue(value)->shrlen);
+			break;
+
+		case LUA_TLNGSTR:
+			PushAt(slot, svalue(value), tsvalue(value)->u.lnglen);
+			break;
+
+		case LUA_TVECTOR2:
+		{
+			slot = ReserveArgs(2);
+			const auto& v = v2value(value);
+			PushAt(slot + 0, v.x);
+			PushAt(slot + 1, v.y);
+			break;
+		}
+
+		case LUA_TVECTOR3:
+		{
+			slot = ReserveArgs(3);
+			const auto& v = v3value(value);
+			PushAt(slot + 0, v.x);
+			PushAt(slot + 1, v.y);
+			PushAt(slot + 2, v.z);
+			break;
+		}
+
+		case LUA_TVECTOR4:
+		{
+			slot = ReserveArgs(4);
+			const auto& v = v4value(value);
+			PushAt(slot + 0, v.x);
+			PushAt(slot + 1, v.y);
+			PushAt(slot + 2, v.z);
+			PushAt(slot + 3, v.w);
+			break;
+		}
+
+		case LUA_TQUAT:
+		{
+			slot = ReserveArgs(4);
+			const auto& v = qvalue(value);
+			PushAt(slot + 0, v.x);
+			PushAt(slot + 1, v.y);
+			PushAt(slot + 2, v.z);
+			PushAt(slot + 3, v.w);
+			break;
+		}
+
+		case LUA_TTABLE: // table (high-level class with __data field)
+			PushTableArgument(idx);
+			break;
+
+		case LUA_TLIGHTUSERDATA:
+			PushMetaPointer(static_cast<uint8_t*>(pvalue(value)));
+			break;
+
+		default:
+			ScriptErrorf("invalid lua type: %s", lua_typename(L, ttnov(value)));
+	}
+#endif
 }
 
 // table parsing implementation
-template<bool IsPtr>
-static LUA_INLINE int fxLuaNativeContext_PushTable(lua_State* L, int idx, fxLuaNativeContext<IsPtr>& context, fxLuaResult& result)
+void LuaScriptNativeContext::PushTableArgument(int idx)
 {
 	const int t_idx = lua_absindex(L, idx);
 	luaL_checkstack(L, 2, "table arguments");
@@ -130,7 +258,7 @@ static LUA_INLINE int fxLuaNativeContext_PushTable(lua_State* L, int idx, fxLuaN
 
 	if (validType(lua_rawget(L, t_idx))) // Account for pushstring if idx < 0
 	{
-		Lua_PushContextArgument(L, -1, context, result);
+		PushArgument(lua_gettop(L));
 		lua_pop(L, 1);
 	}
 	else
@@ -146,778 +274,188 @@ static LUA_INLINE int fxLuaNativeContext_PushTable(lua_State* L, int idx, fxLuaN
 
 		if (validType(lua_type(L, -1)))
 		{
-			Lua_PushContextArgument(L, -1, context, result);
+			PushArgument(lua_gettop(L));
 			lua_pop(L, 1); // [...]
 		}
 		else
 		{
 			lua_pop(L, 1);
-			lua_pushliteral(L, "Invalid Lua type in __data");
-			return lua_error(L);
+			ScriptError("invalid lua type in __data");
 		}
 	}
-	return 1;
 }
 
-template<bool IsPtr>
-static LUA_INLINE void fxLuaNativeContext_PushUserdata(lua_State* L, fxLuaNativeContext<IsPtr>& context, fxLuaResult& result, uint8_t* ptr)
+template<typename T>
+CSCRC_INLINE void LuaScriptNativeContext::ProcessResult(T value)
 {
-	// if the pointer is a metafield
-	if (ptr >= g_metaFields && ptr < &g_metaFields[(int)LuaMetaFields::Max])
+	if constexpr (std::is_same_v<T, bool>)
 	{
-		LuaMetaFields metaField = static_cast<LuaMetaFields>(ptr - g_metaFields);
-
-		// switch on the metafield
-		switch (metaField)
-		{
-			case LuaMetaFields::PointerValueInt:
-			case LuaMetaFields::PointerValueFloat:
-			case LuaMetaFields::PointerValueVector:
-			{
-				result.retvals[result.numReturnValues] = 0;
-
-				if (metaField == LuaMetaFields::PointerValueVector)
-				{
-					result.retvals[result.numReturnValues + 1] = 0;
-					result.retvals[result.numReturnValues + 2] = 0;
-				}
-
-				fxLuaNativeContext_PushPointer(L, context, result, metaField);
-				break;
-			}
-			case LuaMetaFields::ReturnResultAnyway:
-				result.returnResultAnyway = true;
-				break;
-			case LuaMetaFields::ResultAsInteger:
-			case LuaMetaFields::ResultAsLong:
-			case LuaMetaFields::ResultAsString:
-			case LuaMetaFields::ResultAsFloat:
-			case LuaMetaFields::ResultAsVector:
-			case LuaMetaFields::ResultAsObject:
-				result.returnResultAnyway = true;
-				result.returnValueCoercion = metaField;
-				break;
-			default:
-				break;
-		}
+		lua_pushboolean(L, value);
 	}
-	// or if the pointer is a runtime pointer field
-	else if (ptr >= reinterpret_cast<uint8_t*>(result.pointerFields) && ptr < (reinterpret_cast<uint8_t*>(result.pointerFields) + (sizeof(fx::PointerField) * 2)))
+	else if constexpr (std::is_same_v<T, int32_t>)
 	{
-		// guess the type based on the pointer field type
-		const intptr_t ptrField = ptr - reinterpret_cast<uint8_t*>(result.pointerFields);
-		const LuaMetaFields metaField = static_cast<LuaMetaFields>(ptrField / sizeof(fx::PointerField));
-
-		if (metaField == LuaMetaFields::PointerValueInt || metaField == LuaMetaFields::PointerValueFloat)
-		{
-			auto ptrFieldEntry = reinterpret_cast<fx::PointerFieldEntry*>(ptr);
-
-			result.retvals[result.numReturnValues] = ptrFieldEntry->value;
-			ptrFieldEntry->empty = true;
-
-			fxLuaNativeContext_PushPointer(L, context, result, metaField);
-		}
+		lua_pushinteger(L, value);
+	}
+	else if constexpr (std::is_same_v<T, int64_t>)
+	{
+		lua_pushinteger(L, value);
+	}
+	else if constexpr (std::is_same_v<T, float>)
+	{
+		lua_pushnumber(L, value);
+	}
+	else if constexpr (std::is_same_v<T, ScrVector>)
+	{
+#if LUA_VERSION_NUM == 504
+		glm_pushvec3(L, glm::vec<3, glm_Float>(value.x, value.y, value.z));
+#else
+		lua_pushvector3(L, value.x, value.y, value.z);
+#endif
+	}
+	else if constexpr (std::is_same_v<T, const char*>)
+	{
+		lua_pushstring(L, value);
+	}
+	else if constexpr (std::is_same_v<T, ScrString>)
+	{
+		lua_pushlstring(L, value.str, value.len);
+	}
+	else if constexpr (std::is_same_v<T, ScrObject>)
+	{
+		fx::LuaScriptRuntime::GetCurrent()->ResultAsObject(L, std::string_view{ value.data, value.length });
 	}
 	else
 	{
-		// @TODO: Throw an error?
-		fxLuaNativeContext_PushArgument(context, ptr);
+		static_assert(always_false_v<T>, "Invalid return type");
 	}
 }
 
-#if LUA_VERSION_NUM == 504
-/*
-**
-** Convert an acceptable index to a pointer to its respective value.
-** Non-valid indices return the special nil value 'G(L)->nilvalue'.
-*/
-static LUA_INLINE const TValue* __index2value(lua_State* L, int idx)
+static int Lua_DoInvokeNative(lua_State* L, int arg_base, const ScriptNativeHandler& handler)
 {
-	const CallInfo* ci = L->ci;
-	if (idx > 0)
+	LuaScriptNativeContext context(L, handler);
+
+	for (int arg = arg_base, nargs = lua_gettop(L); arg <= nargs; ++arg)
 	{
-		const StkId o = ci->func + idx;
-		api_check(L, idx <= L->ci->top - (ci->func + 1), "unacceptable index");
-		return (o >= L->top) ? &G(L)->nilvalue : s2v(o);
+		context.PushArgument(arg);
 	}
-	else /* negative index */
+
+	context.Invoke();
+
+	int nrets = lua_gettop(L);
+
+	context.ProcessResults([&](auto value)
 	{
-		api_check(L, idx != 0 && -idx <= L->top - (ci->func + 1), "invalid index");
-		return s2v(L->top + idx);
-	}
+		context.ProcessResult(value);
+	});
+
+	nrets = lua_gettop(L) - nrets;
+
+	return nrets;
 }
-#endif
 
-#if LUA_VERSION_NUM == 504
-#define LUA_VALUE(L, I) __index2value((L), (I))
-#else
-#define LUA_VALUE(L, I) lua_getvalue((L), (I))
-#endif
-
-/// <summary>
-/// Consider the possibly converting SHRSTR's to VLNGSTR's to avoid the handler
-/// from invalidating internalized strings.
-/// </summary>
-/// <param name="L"></param>
-/// <param name="idx"></param>
-/// <param name="context"></param>
-/// <returns></returns>
-template<bool IsPtr>
-static int Lua_PushContextArgument(lua_State* L, int idx, fxLuaNativeContext<IsPtr>& context, fxLuaResult& result)
+// Invoke a native, with the hash passed in the first argument
+int Lua_InvokeNative(lua_State* L)
 {
-#if LUA_VERSION_NUM == 504
-	const TValue* value = LUA_VALUE(L, idx);
-	switch (ttypetag(value))
+	try
 	{
-		case LUA_VNIL:
-		case LUA_VFALSE:
-			fxLuaNativeContext_PushArgument(context, 0);
-			break;
-		case LUA_VTRUE:
-			fxLuaNativeContext_PushArgument(context, 1);
-			break;
-		case LUA_VNUMINT:
-			fxLuaNativeContext_PushArgument(context, ivalue(value));
-			break;
-		case LUA_VNUMFLT:
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(fltvalue(value)));
-			break;
-		case LUA_VSHRSTR:
-#if defined(GRIT_POWER_BLOB)
-		case LUA_VBLOBSTR:
-#endif
-		case LUA_VLNGSTR:
-			fxLuaNativeContext_PushArgument(context, svalue(value));
-			break;
-		case LUA_VVECTOR2:
-		{
-			const glmVector& v = vvalue(value);
+		uint64_t hash = lua_tointeger(L, 1);
 
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.x));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.y));
-
-			break;
-		}
-		case LUA_VVECTOR3:
-		{
-			const glmVector& v = vvalue(value);
-
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.x));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.y));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.z));
-
-			break;
-		}
-		case LUA_VVECTOR4:
-		{
-			const glmVector& v = vvalue(value);
-
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.x));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.y));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.z));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.v4.w));
-
-			break;
-		}
-		case LUA_VQUAT: // Support (NOT) GLM_FORCE_QUAT_DATA_XYZW
-		{
-			const glmVector& v = vvalue(value);
-
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.q.x));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.q.y));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.q.z));
-			fxLuaNativeContext_PushArgument(context, static_cast<float>(v.q.w));
-
-			break;
-		}
-		case LUA_VTABLE: // table (high-level class with __data field)
-		{
-			fxLuaNativeContext_PushTable(L, idx, context, result);
-			break;
-		}
-		case LUA_VLIGHTUSERDATA:
-		{
-			fxLuaNativeContext_PushUserdata(L, context, result, reinterpret_cast<uint8_t*>(pvalue(value)));
-			break;
-		}
-		default:
-		{
-			return luaL_error(L, "Invalid Lua type: %s", lua_typename(L, ttype(value)));
-		}
+		return Lua_DoInvokeNative(L, 2, ScriptNativeHandler::FromHash(hash));
 	}
-#else
-	// get the type and decide what to do based on it
-	const auto* value = LUA_VALUE(L, idx);
-	int type = lua_valuetype(L, value);
-
-	// nil: add '0'
-	switch (type)
+	catch (const std::exception& ex)
 	{
-		// nil
-		case LUA_TNIL:
-		{
-			fxLuaNativeContext_PushArgument(context, 0);
-			break;
-		}
-		// integer/float
-		case LUA_TNUMBER:
-		{
-			if (lua_valueisinteger(L, value))
-			{
-				fxLuaNativeContext_PushArgument(context, lua_valuetointeger(L, value));
-			}
-			else if (lua_valueisfloat(L, value))
-			{
-				fxLuaNativeContext_PushArgument(context, static_cast<float>(lua_valuetonumber(L, value)));
-			}
-			break;
-		}
-		// boolean
-		case LUA_TBOOLEAN:
-		{
-			fxLuaNativeContext_PushArgument(context, lua_valuetoboolean(L, value));
-			break;
-		}
-		// table (high-level class with __data field)
-		case LUA_TTABLE:
-		{
-			fxLuaNativeContext_PushTable(L, idx, context, result);
-			break;
-		}
-		// string
-		case LUA_TSTRING:
-		{
-			fxLuaNativeContext_PushArgument(context, lua_valuetostring(L, value));
-			break;
-		}
-		// vectors
-		case LUA_TVECTOR2:
-		{
-			auto f4 = lua_valuetofloat4(L, value);
-
-			fxLuaNativeContext_PushArgument(context, f4.x);
-			fxLuaNativeContext_PushArgument(context, f4.y);
-
-			break;
-		}
-		case LUA_TVECTOR3:
-		{
-			auto f4 = lua_valuetofloat4(L, value);
-
-			fxLuaNativeContext_PushArgument(context, f4.x);
-			fxLuaNativeContext_PushArgument(context, f4.y);
-			fxLuaNativeContext_PushArgument(context, f4.z);
-
-			break;
-		}
-		case LUA_TVECTOR4:
-		case LUA_TQUAT:
-		{
-			auto f4 = lua_valuetofloat4(L, value);
-
-			fxLuaNativeContext_PushArgument(context, f4.x);
-			fxLuaNativeContext_PushArgument(context, f4.y);
-			fxLuaNativeContext_PushArgument(context, f4.z);
-			fxLuaNativeContext_PushArgument(context, f4.w);
-
-			break;
-		}
-		// metafield
-		case LUA_TLIGHTUSERDATA:
-		{
-			uint8_t* ptr = reinterpret_cast<uint8_t*>(lua_valuetolightuserdata(L, value));
-			fxLuaNativeContext_PushUserdata(L, context, result, ptr);
-			break;
-		}
-		default:
-		{
-			return luaL_error(L, "Invalid Lua type: %s", lua_typename(L, type));
-		}
+		lua_pushstring(L, ex.what());
 	}
-#endif
-	return 1;
+
+	// Throw the error after unwinding the stack
+	return lua_error(L);
 }
 
 #ifndef IS_FXSERVER
-#include <ExceptionToModuleHelper.h>
-
-#include <CL2LaunchMode.h>
-struct FastNativeHandler
+// Invoke a native, with the index passed in the first upvalue of the first argument
+// Deprecated, GetNative(Handler) now returns a function to invoke directly
+int Lua_InvokeNative2(lua_State* L)
 {
-	uint64_t hash;
-	rage::scrEngine::NativeHandler handler;
-};
+	try
+	{
+		luaL_argcheck(L, (lua_getupvalue(L, 1, 1) != NULL), 1, "invalid native handler");
 
-LUA_SCRIPT_LINKAGE int Lua_GetNativeHandler(lua_State* L)
-{
-	auto hash = lua_tointeger(L, 1);
-	auto handler = (!launch::IsSDK()) ? rage::scrEngine::GetNativeHandler(hash) : nullptr;
+		size_t index = luaL_checkinteger(L, -1);
+		lua_pop(L, 1);
 
-	auto nativeHandler = (FastNativeHandler*)lua_newuserdata(L, sizeof(FastNativeHandler));
-	nativeHandler->hash = hash;
-	nativeHandler->handler = handler;
+		return Lua_DoInvokeNative(L, 2, ScriptNativeHandler::FromCacheIndex(index));
+	}
+	catch (const std::exception& ex)
+	{
+		lua_pushstring(L, ex.what());
+	}
 
-	return 1;
+	// Throw the error after unwinding the stack
+	return lua_error(L);
 }
-
-static LONG ShouldHandleUnwind(PEXCEPTION_POINTERS ep, DWORD exceptionCode, uint64_t identifier);
-
-static uint64_t g_nativeIdentifier;
-static void* exceptionAddress;
-
-static __declspec(noinline) LONG FilterFunc(PEXCEPTION_POINTERS exceptionInformation)
-{
-	exceptionAddress = exceptionInformation->ExceptionRecord->ExceptionAddress;
-	
-	return ShouldHandleUnwind(exceptionInformation, exceptionInformation->ExceptionRecord->ExceptionCode, g_nativeIdentifier);
-}
-
-static LUA_INLINE void CallHandler(void* handler, uint64_t nativeIdentifier, rage::scrNativeCallContext& rageContext)
-{
-	// call the original function
-	__try
-	{
-		g_nativeIdentifier = nativeIdentifier;
-
-		auto rageHandler = (rage::scrEngine::NativeHandler)handler;
-		rageHandler(&rageContext);
-	}
-	__except (FilterFunc(GetExceptionInformation()))
-	{
-		throw std::exception(va("Error executing native 0x%016llx at address %s.", nativeIdentifier, FormatModuleAddress(exceptionAddress)));
-	}
-}
-
-static void __declspec(safebuffers) CallHandlerSdk(void* handler, uint64_t nativeIdentifier, rage::scrNativeCallContext& rageContext)
-{
-	fxNativeContext context;
-	memcpy(context.arguments, rageContext.GetArgumentBuffer(), sizeof(void*) * rageContext.GetArgumentCount());
-
-	auto& luaRuntime = fx::LuaScriptRuntime::GetCurrent();
-	fx::OMPtr scriptHost = luaRuntime->GetScriptHost();
-
-	HRESULT hr = scriptHost->InvokeNative(context);
-
-	if (!FX_SUCCEEDED(hr))
-	{
-		char* error = "Unknown";
-		scriptHost->GetLastErrorText(&error);
-
-		throw std::runtime_error(va("%s", error));
-	}
-
-	memcpy(rageContext.GetArgumentBuffer(), context.arguments, sizeof(void*) * 3);
-}
-
-static void __declspec(safebuffers) CallHandlerUniversal(void* handler, uint64_t nativeIdentifier, rage::scrNativeCallContext& rageContext);
-static decltype(&CallHandlerUniversal) g_callHandler = &CallHandlerUniversal;
-
-static void __declspec(safebuffers) CallHandlerUniversal(void* handler, uint64_t nativeIdentifier, rage::scrNativeCallContext& rageContext)
-{
-	if (launch::IsSDK())
-	{
-		g_callHandler = &CallHandlerSdk;
-	}
-	else
-	{
-		g_callHandler = &CallHandler;
-	}
-
-	return g_callHandler(handler, nativeIdentifier, rageContext);
-}
-#endif
-
-//
-// Sanitization for string result types
-// Loops through all values given by the ScRT and denies any that equals the result value which isn't of the string type
-// Uhm what happened to all these context types? o.O
-void NativeStringResultSanitization(lua_State* state, int inputSize, uint64_t hash, uintptr_t* arguments, int numArguments, uintptr_t* initialArguments)
-{
-	const auto resultValue = arguments[0];
-
-	// Step 1: quick compare all values until we found a hit
-	// By not switching between all the buffers (incl. input arguments) we'll not introduce unnecessary cache misses.
-	for (int a = 0; a < numArguments; ++a)
-	{
-		if (initialArguments[a] == resultValue)
-		{
-			// Step 2: loop our input list for as many times as `a` was increased
-			for (int i = 2; i < inputSize; ++i)
-			{
-				// `a` can be reused by simply decrementing it, we'll go negative when we hit our goal as we decrement before checking (e.g.: `0 - 1 = -1` or `0 - 4 = -4`)
-				const auto luaType = lua_type(state, i);
-				switch (luaType)
-				{
-#if LUA_VERSION_NUM == 504
-					case LUA_VVECTOR2:
-#else
-					case LUA_TVECTOR2:
-#endif
-						a -= 2;
-						break;
-#if LUA_VERSION_NUM == 504
-					case LUA_VVECTOR3:
-#else
-					case LUA_TVECTOR3:
-#endif
-						a -= 3;
-						break;
-#if LUA_VERSION_NUM == 504
-					case LUA_VQUAT:
-					case LUA_VVECTOR4:
-#else
-					case LUA_TQUAT:
-					case LUA_TVECTOR4:
-#endif
-						a -= 4;
-						break;
-					default:
-						a--;
-						break;
-				}
-
-				// string type is allowed
-				if (a < 0)
-				{
-					if (luaType != LUA_TSTRING)
-					{
-						fx::ScriptTrace("Warning: Sanitized coerced string result for native %016x.\n", hash);
-						arguments[0] = 0;
-					}
-
-					return; // we found our arg, no more to check
-				}
-			}
-
-			return; // found our value, no more to check
-		}
-	}
-}
-
-template<bool IsPtr>
-static int __Lua_InvokeNative(lua_State* L)
-{
-	std::conditional_t<IsPtr, void*, uint64_t> hash;
-	uint64_t origHash;
-
-	LUA_IF_CONSTEXPR(!IsPtr)
-	{
-		// get the hash
-		origHash = hash = lua_tointeger(L, 1);
-	}
-#ifndef IS_FXSERVER
-	else
-	{
-		auto handlerRef = (FastNativeHandler*)lua_touserdata(L, 1);
-		if (!handlerRef)
-		{
-			luaL_error(L, "not a userdata");
-			return 0;
-		}
-
-		hash = handlerRef->handler;
-		origHash = handlerRef->hash;
-	}
-#endif
 
 #ifdef GTA_FIVE
-	// hacky super fast path for 323 GET_HASH_KEY in GTA
-	if (origHash == 0xD24D37CC275948CC)
+static int Lua_GetHashKey(lua_State* L)
+{
+	// if NULL or an integer, return 0
+	if (lua_isnil(L, 1) || lua_type(L, 1) == LUA_TNUMBER)
 	{
-		// if NULL or an integer, return 0
-		if (lua_isnil(L, 2) || lua_type(L, 2) == LUA_TNUMBER)
-		{
-			lua_pushinteger(L, 0);
-
-			return 1;
-		}
-
-		const char* str = luaL_checkstring(L, 2);
-		lua_pushinteger(L, static_cast<lua_Integer>(static_cast<int32_t>(HashString(str))));
-
-		return 1;
-	}
-#endif
-
-	// get required entries
-	auto& luaRuntime = fx::LuaScriptRuntime::GetCurrent();
-	fx::OMPtr scriptHost = luaRuntime->GetScriptHost();
-
-	// variables to hold state
-	fxLuaNativeContext<IsPtr> context;
-	fxLuaResult result(luaRuntime->GetPointerFields());
-
-	LUA_IF_CONSTEXPR(!IsPtr)
-	{
-		context.nativeIdentifier = (uint64_t)hash;
-	}
-
-	// get argument count for the loop
-	const int numArgs = lua_gettop(L);
-	for (int arg = 2; arg <= numArgs; arg++)
-	{
-		if (!Lua_PushContextArgument(L, arg, context, result))
-		{
-			return luaL_error(L, "Unexpected context result");
-		}
-	}
-
-#if __has_include(<PointerArgumentHints.h>)
-	fx::scripting::ResultType resultTypeIntent = fx::scripting::ResultType::None;
-
-	if (!result.returnResultAnyway)
-	{
-		resultTypeIntent = fx::scripting::ResultType::Void;
-	}
-	else if (result.returnValueCoercion == LuaMetaFields::ResultAsString)
-	{
-		resultTypeIntent = fx::scripting::ResultType::String;
-	}
-	else if (result.returnValueCoercion == LuaMetaFields::ResultAsInteger ||
-		result.returnValueCoercion == LuaMetaFields::ResultAsLong ||
-		result.returnValueCoercion == LuaMetaFields::ResultAsFloat ||
-		result.returnValueCoercion == LuaMetaFields::Max /* bool */)
-	{
-		resultTypeIntent = fx::scripting::ResultType::Scalar;
-	}
-	else if (result.returnValueCoercion == LuaMetaFields::ResultAsVector)
-	{
-		resultTypeIntent = fx::scripting::ResultType::Vector;
-	}
-#endif
-
-	// invoke the native on the script host
-#ifndef IS_FXSERVER
-	// preemptive safety check for the input argument to *not* show up in the output
-	bool needsResultCheck = (result.numReturnValues == 0 || result.returnResultAnyway);
-	auto a1type = lua_type(L, 2);
-	bool hadComplexType = (a1type != LUA_TNUMBER && a1type != LUA_TNIL && a1type != LUA_TBOOLEAN);
-
-	decltype(context.arguments) initialArguments;
-	memcpy(initialArguments, context.arguments, sizeof(context.arguments));
-
-	LUA_IF_CONSTEXPR(IsPtr)
-	{
-		// zero out three following arguments
-		if (context.numArguments <= 29)
-		{
-			context.arguments[context.numArguments + 0] = 0;
-			context.arguments[context.numArguments + 1] = 0;
-			context.arguments[context.numArguments + 2] = 0;
-		}
-
-		auto handler = hash;
-		context.SetArgumentCount(context.numArguments);
-
-		try
-		{
-			if (handler)
-			{
-				g_callHandler(handler, origHash, context);
-			}
-
-			// append vector3 result components
-			context.SetVectorResults();
-		}
-		catch (std::exception& e)
-		{
-			fx::ScriptTrace("%s: execution failed: %s\n", __func__, e.what());
-			lua_pushstring(L, va("Execution of native %016llx in script host failed: %s", origHash, e.what()));
-			lua_error(L);
-		}
+		lua_pushinteger(L, 0);
 	}
 	else
-#endif
 	{
-		result_t hr = scriptHost->InvokeNative(context);
-
-		if (!FX_SUCCEEDED(hr))
-		{
-			char* error = "Unknown";
-			scriptHost->GetLastErrorText(&error);
-
-			lua_pushstring(L, va("Execution of native %016llx in script host failed: %s", origHash, error));
-			lua_error(L);
-		}
+		const char* str = luaL_checkstring(L, 1);
+		lua_pushinteger(L, static_cast<lua_Integer>(static_cast<int32_t>(HashString(str))));
 	}
 
-#ifndef IS_FXSERVER
-	// clean up the result
-	if ((needsResultCheck || hadComplexType) && context.numArguments > 0)
-	{
-		// if this is scrstring but nothing changed (very weird!), fatally fail
-		if (static_cast<uint32_t>(context.arguments[2]) == SCRSTRING_MAGIC_BINARY && initialArguments[2] == context.arguments[2])
-		{
-			FatalError("Invalid native call in resource '%s'. Please see https://aka.cfx.re/scrstring-mitigation for more information.", luaRuntime->GetResourceName());
-		}
-
-		// If return coercion is String type
-		// Don't allow deref'ing arbitrary pointers passed in any of the arguments.
-		if (result.returnValueCoercion == LuaMetaFields::ResultAsString && context.arguments[0])
-		{
-			NativeStringResultSanitization(L, numArgs, origHash, context.arguments, context.numArguments, initialArguments);
-		}
-		// if the first value (usually result) is the same as the initial argument, clear the result (usually, result was no-op)
-		// (if vector results, these aren't directly unsafe, and may get incorrectly seen as complex)
-		else if (context.arguments[0] == initialArguments[0] && result.returnValueCoercion != LuaMetaFields::ResultAsVector)
-		{
-			// complex type in first result means we have to clear that result
-			if (hadComplexType)
-			{
-				context.arguments[0] = 0;
-			}
-
-			// if any result is requested and there was *no* change, zero out
-			context.arguments[1] = 0;
-			context.arguments[2] = 0;
-			context.arguments[3] = 0;
-		}
-	}
-#endif
-
-#if __has_include(<PointerArgumentHints.h>)
-	if (resultTypeIntent != fx::scripting::ResultType::None)
-	{
-		fx::scripting::PointerArgumentHints::CleanNativeResult(origHash, resultTypeIntent, context.arguments);
-	}
-#endif
-
-	// number of Lua results
-	int numResults = 0;
-
-	// if no other result was requested, or we need to return the result anyway, push the result
-	if (result.numReturnValues == 0 || result.returnResultAnyway)
-	{
-		// increment the result count
-		numResults++;
-
-		// handle the type coercion
-		switch (result.returnValueCoercion)
-		{
-			case LuaMetaFields::ResultAsString:
-			{
-				auto strString = reinterpret_cast<scrString*>(&context.arguments[0]);
-
-				if (strString->magic == SCRSTRING_MAGIC_BINARY)
-				{
-					lua_pushlstring(L, strString->str, strString->len);
-				}
-				else if (strString->str)
-				{
-					lua_pushstring(L, strString->str);
-				}
-				else
-				{
-					lua_pushnil(L);
-				}
-
-				break;
-			}
-			case LuaMetaFields::ResultAsFloat:
-			{
-				lua_pushnumber(L, *reinterpret_cast<float*>(&context.arguments[0]));
-				break;
-			}
-			case LuaMetaFields::ResultAsVector:
-			{
-				const scrVector& vector = *reinterpret_cast<scrVector*>(&context.arguments[0]);
-#if LUA_VERSION_NUM == 504
-				glm_pushvec3(L, glm::vec<3, glm_Float>(vector.x, vector.y, vector.z));
-#else
-				lua_pushvector3(L, vector.x, vector.y, vector.z);
-#endif
-				break;
-			}
-			case LuaMetaFields::ResultAsObject:
-			{
-				scrObject object = *reinterpret_cast<scrObject*>(&context.arguments[0]);
-				luaRuntime->ResultAsObject(L, std::string_view{ object.data, object.length });
-				break;
-			}
-			case LuaMetaFields::ResultAsInteger:
-			{
-				lua_pushinteger(L, *reinterpret_cast<int32_t*>(&context.arguments[0]));
-				break;
-			}
-			case LuaMetaFields::ResultAsLong:
-			{
-				lua_pushinteger(L, *reinterpret_cast<int64_t*>(&context.arguments[0]));
-				break;
-			}
-			default:
-			{
-				const int32_t integer = *reinterpret_cast<int32_t*>(&context.arguments[0]);
-
-				if ((integer & 0xFFFFFFFF) == 0)
-				{
-					lua_pushboolean(L, false);
-				}
-				else
-				{
-					lua_pushinteger(L, integer);
-				}
-				break;
-			}
-		}
-	}
-
-	// loop over the return value pointers
-	{
-		int i = 0;
-
-		while (i < result.numReturnValues)
-		{
-			switch (result.rettypes[i])
-			{
-				case LuaMetaFields::PointerValueInt:
-				{
-					lua_pushinteger(L, *reinterpret_cast<int32_t*>(&result.retvals[i]));
-					i++;
-					break;
-				}
-				case LuaMetaFields::PointerValueFloat:
-				{
-					lua_pushnumber(L, *reinterpret_cast<float*>(&result.retvals[i]));
-					i++;
-					break;
-				}
-				case LuaMetaFields::PointerValueVector:
-				{
-					const scrVector& vector = *reinterpret_cast<scrVector*>(&result.retvals[i]);
-#if LUA_VERSION_NUM == 504
-					glm_pushvec3(L, glm::vec<3, glm_Float>(vector.x, vector.y, vector.z));
-#else
-					lua_pushvector3(L, vector.x, vector.y, vector.z);
-#endif
-
-					i += 3;
-					break;
-				}
-				default:
-					break;
-			}
-
-			numResults++;
-		}
-	}
-
-	// and return with the 'desired' amount of results
-	return numResults;
+	return 1;
 }
+#endif
 
-LUA_SCRIPT_LINKAGE int Lua_InvokeNative(lua_State* L)
+static int Lua_InvokeNativeHandler(lua_State* L)
 {
-	return __Lua_InvokeNative<false>(L);
+	try
+	{
+		size_t index = lua_tointeger(L, lua_upvalueindex(1));
+
+		return Lua_DoInvokeNative(L, 1, ScriptNativeHandler::FromCacheIndex(index));
+	}
+	catch (const std::exception& ex)
+	{
+		lua_pushstring(L, ex.what());
+	}
+
+	// Throw the error after unwinding the stack
+	return lua_error(L);
+};
+
+int Lua_GetNativeHandler(lua_State* L)
+{
+	uint64_t hash = lua_tointeger(L, 1); // TODO: Use luaL_checkinteger
+
+	// TOOD: Store the handler pointer directly? Not sure if we can trust userdata
+	size_t index = ScriptNativeHandler::FromHash(hash).cache_index;
+	lua_pushinteger(L, index);
+
+	lua_CFunction handler = Lua_InvokeNativeHandler;
+
+#ifdef GTA_FIVE
+	// super fast path for 323 GET_HASH_KEY in GTA
+	if (hash == 0xD24D37CC275948CC)
+	{
+		handler = Lua_GetHashKey;
+	}
+#endif
+
+	lua_pushcclosure(L, handler, 1);
+	return 1;
 }
 
-LUA_SCRIPT_LINKAGE int Lua_InvokeNative2(lua_State* L)
-{
-	return __Lua_InvokeNative<true>(L);
-}
+#endif
 
 #pragma region Lua_LoadNative
 
-LUA_SCRIPT_LINKAGE int Lua_LoadNative(lua_State* L)
+int Lua_LoadNative(lua_State* L)
 {
 	const char* fn = luaL_checkstring(L, 1);
 	auto fnHash = HashRageString(fn);
@@ -942,9 +480,9 @@ LUA_SCRIPT_LINKAGE int Lua_LoadNative(lua_State* L)
 			runtime->GetScriptHost2()->GetNumResourceMetaData("use_experimental_fxv2_oal", &isCfxv2);
 		}
 
-		//#if !defined(GTA_FIVE) || (LUA_VERSION_NUM == 504)
+		// #if !defined(GTA_FIVE) || (LUA_VERSION_NUM == 504)
 		if (isCfxv2)
-		//#endif
+		// #endif
 		{
 			auto nativeImpl = Lua_GetNative(L, fn);
 
@@ -1021,6 +559,10 @@ LUA_SCRIPT_LINKAGE int Lua_LoadNative(lua_State* L)
 
 using Lua_NativeMap = std::map<std::string, lua_CFunction, std::less<>>;
 
+using scrVectorLua = ScrVector;
+using scrObject = ScrObject;
+using scrString = ScrString;
+
 struct LuaArgumentParser
 {
 	// Parsing function arguments.
@@ -1039,7 +581,7 @@ struct LuaArgumentParser
 	template<typename T>
 	static LUA_INLINE T ParseInteger(lua_State* L, int idx)
 	{
-		const TValue* value = LUA_VALUE(L, idx);
+		const TValue* value = LuaGetLocal(L, idx);
 
 		if (ttisinteger(value))
 		{
@@ -1076,7 +618,7 @@ struct LuaArgumentParser
 template<>
 LUA_INLINE bool LuaArgumentParser::ParseArgument<bool>(lua_State* L, int idx)
 {
-	const TValue* value = LUA_VALUE(L, idx);
+	const TValue* value = LuaGetLocal(L, idx);
 	if (ttisinteger(value))
 		return ivalue(value) != 0;
 	return l_isfalse(value) ? false : true;
@@ -1085,14 +627,14 @@ LUA_INLINE bool LuaArgumentParser::ParseArgument<bool>(lua_State* L, int idx)
 template<>
 LUA_INLINE float LuaArgumentParser::ParseArgument<float>(lua_State* L, int idx)
 {
-	const TValue* value = LUA_VALUE(L, idx);
+	const TValue* value = LuaGetLocal(L, idx);
 	return ttisnumber(value) ? sc_nvalue(value, float) : 0.f;
 }
 
 template<>
 LUA_INLINE double LuaArgumentParser::ParseArgument<double>(lua_State* L, int idx)
 {
-	const TValue* value = LUA_VALUE(L, idx);
+	const TValue* value = LuaGetLocal(L, idx);
 	return ttisnumber(value) ? sc_nvalue(value, double) : 0.0;
 }
 
@@ -1128,7 +670,7 @@ LUA_INLINE lua_Integer LuaArgumentParser::ParseArgument<lua_Integer>(lua_State* 
 template<>
 LUA_INLINE uint32_t LuaArgumentParser::ParseArgument<uint32_t>(lua_State* L, int idx)
 {
-	const TValue* o = LUA_VALUE(L, idx);
+	const TValue* o = LuaGetLocal(L, idx);
 #if LUA_VERSION_NUM == 504
 	if (ttisstring(o))
 		return HashString(svalue(o));
@@ -1154,11 +696,13 @@ LUA_INLINE uint32_t LuaArgumentParser::ParseArgument<uint32_t>(lua_State* L, int
 template<>
 LUA_INLINE const char* LuaArgumentParser::ParseArgument<const char*>(lua_State* L, int idx)
 {
-	const TValue* value = LUA_VALUE(L, idx);
+	const TValue* value = LuaGetLocal(L, idx);
 	switch (ttype(value))
 	{
-		case LUA_TNIL: return NULL;
-		case LUA_TSTRING: return svalue(value);
+		case LUA_TNIL:
+			return NULL;
+		case LUA_TSTRING:
+			return svalue(value);
 		case LUA_TNUMBER:
 		{
 			if ((ttisinteger(value) && ivalue(value) == 0)
@@ -1177,7 +721,7 @@ LUA_INLINE const char* LuaArgumentParser::ParseArgument<const char*>(lua_State* 
 template<>
 LUA_INLINE scrVectorLua LuaArgumentParser::ParseArgument<scrVectorLua>(lua_State* L, int idx)
 {
-	const TValue* o = LUA_VALUE(L, idx);
+	const TValue* o = LuaGetLocal(L, idx);
 #if LUA_VERSION_NUM == 504
 	if (ttisvector(o))
 	{
@@ -1273,7 +817,7 @@ LUA_INLINE void LuaArgumentParser::PushObject<const scrObject&>(lua_State* L, co
 template<>
 LUA_INLINE void LuaArgumentParser::PushObject<const scrString&>(lua_State* L, const scrString& val)
 {
-	if (val.magic == SCRSTRING_MAGIC_BINARY)
+	if (val.magic == ScrString::Signature)
 		lua_pushlstring(L, val.str, val.len);
 	else if (val.str)
 		lua_pushstring(L, val.str);
@@ -1288,6 +832,7 @@ LUA_INLINE void LuaArgumentParser::PushObject<const scrString&>(lua_State* L, co
 	if (!lua_asserttop(L, count)) \
 		return 0;
 
+// TODO: Remove this!
 struct LuaNativeWrapper
 {
 	LUA_INLINE LuaNativeWrapper(uint64_t)
@@ -1299,7 +844,7 @@ struct LuaNativeContext : public fxNativeContext
 {
 	LUA_INLINE LuaNativeContext(void*, int numArguments)
 	{
-		numArguments = numArguments;
+		this->numArguments = numArguments;
 		numResults = 0;
 	}
 
@@ -1342,7 +887,7 @@ struct LuaNativeContext : public fxNativeContext
 
 		*reinterpret_cast<TVal*>(&arguments[numArguments]) = val;
 
-		LUA_IF_CONSTEXPR(sizeof(TVal) == sizeof(scrVector))
+		LUA_IF_CONSTEXPR(sizeof(TVal) == sizeof(scrVectorLua))
 		{
 			numArguments += 3;
 		}
@@ -1354,6 +899,10 @@ struct LuaNativeContext : public fxNativeContext
 };
 
 #else
+
+#include <scrEngine.h>
+#include <ExceptionToModuleHelper.h>
+#include <CL2LaunchMode.h>
 
 #define LUA_EXC_WRAP_START(hash) \
 	try                          \
@@ -1419,7 +968,7 @@ struct LuaNativeContext
 	LuaNativeWrapper* nw;
 
 	LUA_INLINE LuaNativeContext(LuaNativeWrapper* nw, int numArguments)
-		: rawCxt(arguments, numArguments), numArguments(numArguments), nw(nw)
+		: rawCxt(arguments, arguments, numArguments), numArguments(numArguments), nw(nw)
 	{
 	}
 
@@ -1465,7 +1014,7 @@ struct LuaNativeContext
 
 		*reinterpret_cast<TVal*>(&arguments[numArguments]) = val;
 
-		LUA_IF_CONSTEXPR(sizeof(TVal) == sizeof(scrVector))
+		LUA_IF_CONSTEXPR(sizeof(TVal) == sizeof(scrVectorLua))
 		{
 			numArguments += 3;
 		}
@@ -1484,16 +1033,18 @@ struct LuaNativeContext
 #endif
 
 #if INCLUDE_FXV2_NATIVES
-#if !defined(IS_FXSERVER) && defined(GTA_FIVE)
+#if defined(GTA_FIVE)
 #include "Natives.h"
+#elif defined(IS_RDR3)
+#include "NativesRDR.h"
 #elif defined(IS_FXSERVER)
 #include "NativesServer.h"
 #endif
 #endif
 
-LUA_SCRIPT_LINKAGE lua_CFunction Lua_GetNative(lua_State* L, const char* name)
+lua_CFunction Lua_GetNative(lua_State* L, const char* name)
 {
-#if INCLUDE_FXV2_NATIVES && (defined(GTA_FIVE) || defined(IS_FXSERVER))
+#if INCLUDE_FXV2_NATIVES && !defined(GTA_NY)
 	auto it = natives.find(name);
 	return (it != natives.end()) ? it->second : nullptr;
 #else
@@ -1507,38 +1058,6 @@ static InitFunction initFunction([]()
 	{
 		self->OnTick.Connect([self]()
 		{
-			constexpr uint64_t GET_GAME_TIMER =
-#ifdef IS_FXSERVER
-			0xa4ea0691
-#elif defined(GTA_FIVE)
-			0x9CD27B0045628463
-#elif defined(IS_RDR3)
-			0x4F67E8ECA7D3F667
-#elif defined(GTA_NY)
-			0x022B2DA9
-#else
-#error Undefined GET_GAME_TIMER
-#endif
-			;
-
-#ifdef IS_FXSERVER
-			if (fx::LuaScriptRuntime::GetLastHost())
-#endif
-			{
-				static LuaNativeWrapper nW(GET_GAME_TIMER);
-				LuaNativeContext nCtx(&nW, 0);
-#ifdef GTA_NY
-				nCtx.Push(&g_tickTime);
-#endif
-				nCtx.Invoke(nullptr, GET_GAME_TIMER);
-
-#ifdef IS_FXSERVER
-				g_tickTime = nCtx.GetResult<int64_t>();
-#elif !defined(GTA_NY)
-				g_tickTime = nCtx.GetResult<int32_t>();
-#endif
-			}
-
 			g_hadProfiler = self->GetComponent<fx::ProfilerComponent>()->IsRecording();
 		},
 		INT32_MIN);
@@ -1546,5 +1065,3 @@ static InitFunction initFunction([]()
 });
 
 #pragma endregion
-
-#endif

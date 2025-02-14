@@ -8,6 +8,7 @@ const EXT_LOCALFUNCREF = 11;
 	let boundaryIdx = 1;
 	let lastBoundaryStart = null;
 	const isDuplicityVersion = IsDuplicityVersion();
+	const currentResourceName = GetCurrentResourceName();
 
 	// temp
 	global.FormatStackTrace = function (args, argLength) {
@@ -76,13 +77,30 @@ const EXT_LOCALFUNCREF = 11;
 
 	function refFunctionUnpacker(refSerialized) {
 		const fnRef = Citizen.makeFunctionReference(refSerialized);
+		const invoker = GetInvokingResource();
 
 		return function (...args) {
 			return runWithBoundaryEnd(() => {
-				const retvals = unpack(fnRef(pack(args)));
+				let retvals = null;
+				try {
+					retvals = unpack(fnRef(pack(args)));
+				} catch (e) {
+				}
 
 				if (retvals === null) {
-					throw new Error('Error in nested ref call.');
+					let errorMessage = `Error in nested ref call for ${currentResourceName}. `
+					// invoker can be null, we don't want to give an even worse
+					// error by erroring here :P
+					if (invoker) {
+						errorMessage += `${currentResourceName} tried to call a function reference in ${invoker} but the reference wasn't valid. `
+						if (GetResourceState(invoker) !== "started") {
+							errorMessage += `And ${invoker} isn't started, was the resource restarted mid call?`
+						} else {
+							errorMessage += `(did ${invoker} restart recently?)`
+						}
+					}
+
+					throw new Error(errorMessage);
 				}
 
 				switch (retvals.length) {
@@ -207,6 +225,9 @@ const EXT_LOCALFUNCREF = 11;
 	global.addRawEventListener = rawEmitter.on.bind(rawEmitter);
 	global.addRawEventHandler = global.addRawEventListener;
 
+	// Raw events configuration
+	global.setMaxRawEventListeners = rawEmitter.setMaxListeners.bind(rawEmitter);
+
 	// Client events
 	global.addEventListener = (name, callback, netSafe = false) => {
 		if (netSafe) {
@@ -218,6 +239,9 @@ const EXT_LOCALFUNCREF = 11;
 		emitter.on(name, callback);
 	};
 	global.on = global.addEventListener;
+
+	// Event Emitter configuration
+	global.setMaxEventListeners = emitter.setMaxListeners.bind(emitter);
 
 	// Net events
 	global.addNetEventListener = (name, callback) => global.addEventListener(name, callback, true);
@@ -463,10 +487,21 @@ const EXT_LOCALFUNCREF = 11;
 				global.source = parseInt(source.substr(13));
 			}
 
-			const payload = unpack(payloadSerialized) || [];
-			const listeners = emitter.listeners(name);
+			// Running raw event listeners
+			try {
+				rawEmitter.emit(name, payloadSerialized, source);
+			} catch (e) {
+				console.error('Unhandled error during running raw event listeners', e);
+			}
 
-			if (listeners.length === 0 || !Array.isArray(payload)) {
+			const listeners = emitter.listeners(name);
+			if (listeners.length == 0) {
+				global.source = null;
+				return;
+			}
+
+			const payload = unpack(payloadSerialized) || [];
+			if(!Array.isArray(payload)) {
 				global.source = null;
 				return;
 			}
@@ -490,13 +525,6 @@ const EXT_LOCALFUNCREF = 11;
 				}
 			}
 
-			// Running raw event listeners
-			try {
-				rawEmitter.emit(name, payloadSerialized, source);
-			} catch (e) {
-				console.error('Unhandled error during running raw event listeners', e);
-			}
-
 			global.source = null;
 		});
 	});
@@ -509,7 +537,7 @@ const EXT_LOCALFUNCREF = 11;
 	const getExportEventName = (resource, name) => `__cfx_export_${resource}_${name}`;
 
 	on(`on${eventType}ResourceStart`, (resource) => {
-		if (resource === GetCurrentResourceName()) {
+		if (resource === currentResourceName) {
 			const numMetaData = GetNumResourceMetadata(resource, exportKey) || 0;
 
 			for (let i = 0; i < numMetaData; i++) {
@@ -572,7 +600,7 @@ const EXT_LOCALFUNCREF = 11;
 
 				const [exportName, func] = args;
 
-				on(getExportEventName(GetCurrentResourceName(), exportName), (setCB) => {
+				on(getExportEventName(currentResourceName, exportName), (setCB) => {
 					setCB(func);
 				});
 			},

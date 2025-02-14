@@ -9,6 +9,10 @@
 #include <CrossBuildRuntime.h>
 #include <Error.h>
 
+#include "FramePacketHandler.h"
+#include "IHost.h"
+#include "netTimeSync.h"
+
 NetLibrary* g_netLibrary;
 
 // shared relay functions (from early rev. gta:net:five; do update!)
@@ -200,8 +204,15 @@ static HookFunction initFunction([]()
 
 	ObjectIds_BindNetLibrary(g_netLibrary);
 
-	g_netLibrary->OnBuildMessage.Connect([](const std::function<void(uint32_t, const char*, int)>& writeReliable)
+	g_netLibrary->OnBuildMessage.Connect([]()
 	{
+		ICoreGameInit* cgi = Instance<ICoreGameInit>::Get();
+
+		if (cgi->OneSyncEnabled)
+		{
+			return;
+		}
+
 		static bool lastHostState;
 
 		// hostie
@@ -210,8 +221,9 @@ static HookFunction initFunction([]()
 		{
 			if (isHost)
 			{
-				auto base = g_netLibrary->GetServerBase();
-				writeReliable(HashRageString("msgIHost"), (char*)&base, sizeof(base));
+				net::packet::ClientIHostPacket iHostPacket;
+				iHostPacket.data.baseNum = g_netLibrary->GetServerBase();
+				g_netLibrary->SendNetPacket(iHostPacket);
 			}
 
 			lastHostState = isHost;
@@ -226,36 +238,7 @@ static HookFunction initFunction([]()
 		}
 	});
 
-	g_netLibrary->AddReliableHandler("msgFrame", [](const char* data, size_t len)
-	{
-		net::Buffer buffer(reinterpret_cast<const uint8_t*>(data), len);
-		auto idx = buffer.Read<uint32_t>();
-
-		auto icgi = Instance<ICoreGameInit>::Get();
-
-		uint8_t strictLockdown = 0;
-
-		if (icgi->NetProtoVersion >= 0x202002271209)
-		{
-			strictLockdown = buffer.Read<uint8_t>();
-		}
-
-		static uint8_t lastStrictLockdown;
-
-		if (strictLockdown != lastStrictLockdown)
-		{
-			if (!strictLockdown)
-			{
-				icgi->ClearVariable("strict_entity_lockdown");
-			}
-			else
-			{
-				icgi->SetVariable("strict_entity_lockdown");
-			}
-
-			lastStrictLockdown = strictLockdown;
-		}
-	}, true);
+	g_netLibrary->AddPacketHandler<fx::FramePacketHandler>(true);
 
 	OnMainGameFrame.Connect([]()
 	{
@@ -711,8 +694,6 @@ struct LoggedInt
 	int value;
 };
 
-bool IsWaitingForTimeSync();
-
 static int ReturnTrue()
 {
 	return true;
@@ -722,7 +703,7 @@ static HookFunction hookFunction([]()
 {
 	static ConsoleCommand quitCommand("quit", [](const std::string& message)
 	{
-		g_quitMsg = message;
+		g_quitMsg = "Quit: " + message;
 		ExitProcess(-1);
 	});
 
@@ -892,7 +873,7 @@ static HookFunction hookFunction([]()
 		case 5:
 			if (cgi->OneSyncEnabled)
 			{
-				if (IsWaitingForTimeSync())
+				if (sync::IsWaitingForTimeSync())
 				{
 					return;
 				}

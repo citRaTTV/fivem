@@ -8,6 +8,9 @@
 #include "StdInc.h"
 #include <Local.h>
 
+#include <array>
+#include <vector>
+
 #include <ScriptEngine.h>
 #include <Hooking.h>
 #include <scrEngine.h>
@@ -15,6 +18,34 @@
 #include "RageParser.h"
 #include "Resource.h"
 #include "ScriptWarnings.h"
+#include <Train.h>
+#include <CrashFixes.FakeParachuteProp.h>
+#include "ropeManager.h"
+
+static void BlockForbiddenNatives()
+{
+	std::vector<uint64_t> nativesToBlock = rage::scrEngine::GetBlockedNatives();
+	for (auto native: nativesToBlock)
+	{
+		auto origHandler = fx::ScriptEngine::GetNativeHandler(native);
+		if (!origHandler)
+		{
+			continue;
+		}
+
+		fx::ScriptEngine::RegisterNativeHandler(native, [=](fx::ScriptContext& ctx)
+		{
+			if (rage::scrEngine::GetStoryMode())
+			{
+				origHandler(ctx);
+			}
+			else
+			{
+				ctx.SetResult<uintptr_t>(0);
+			}
+		});
+	}
+}
 
 static void FixVehicleWindowNatives()
 {
@@ -49,7 +80,7 @@ static void FixVehicleWindowNatives()
 
 				if (windowIndex >= 0 && windowIndex <= 7)
 				{
-					return (*handler)(ctx);
+					return handler(ctx);
 				}
 			}
 
@@ -81,7 +112,7 @@ static void FixClockTimeOverrideNative()
 
 		if (hours < 24 && minutes < 60 && seconds < 60)
 		{
-			(*handler)(ctx);
+			handler(ctx);
 		}
 	});
 }
@@ -90,14 +121,12 @@ static void FixGetVehiclePedIsIn()
 {
 	constexpr const uint64_t nativeHash = 0x9A9112A0FE9A4713; // GET_VEHICLE_PED_IS_IN
 
-	auto handlerWrap = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!handlerWrap)
+	if (!handler)
 	{
 		return;
 	}
-
-	auto handler = *handlerWrap;
 
 	auto location = hook::get_pattern<char>("80 8F ? ? ? ? 01 8B 86 ? ? ? ? C1 E8 1E");
 	static uint32_t PedFlagsOffset = *reinterpret_cast<uint32_t*>(location + 9);
@@ -156,13 +185,12 @@ static void FixClearPedBloodDamage()
 
 	constexpr const uint64_t nativeHash = 0x8FE22675A5A45817; // CLEAR_PED_BLOOD_DAMAGE
 
-	auto handlerWrap = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!handlerWrap)
+	if (!handler)
 	{
 		return;
 	}
-	auto handler = *handlerWrap;
 
 	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
 	{
@@ -189,14 +217,12 @@ static void FixSetPedFaceFeature()
 {
 	constexpr const uint64_t nativeHash = 0x71A5C1DBA060049E; // _SET_PED_FACE_FEATURE
 
-	auto originalHandler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!originalHandler)
+	if (!handler)
 	{
 		return;
 	}
-
-	auto handler = *originalHandler;
 
 	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
 	{
@@ -253,14 +279,12 @@ static void FixStartEntityFire()
 {
 	constexpr const uint64_t nativeHash = 0xF6A9D9708F6F23DF; // START_ENTITY_FIRE
 
-	auto originalHandler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!originalHandler)
+	if (!handler)
 	{
 		return;
 	}
-
-	auto handler = *originalHandler;
 
 	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
 	{
@@ -273,14 +297,12 @@ static void FixStopEntityFire()
 {
 	constexpr const uint64_t nativeHash = 0x7F0DD2EBBB651AFF; // STOP_ENTITY_FIRE
 
-	const auto originalHandler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	const auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!originalHandler)
+	if (!handler)
 	{
 		return;
 	}
-
-	const auto handler = *originalHandler;
 
 	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
 	{
@@ -343,14 +365,12 @@ static void FixPedCombatAttributes()
 
 	constexpr const uint64_t nativeHash = 0x9F7794730795E019; // SET_PED_COMBAT_ATTRIBUTES
 
-	auto originalHandler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
 
-	if (!originalHandler)
+	if (!handler)
 	{
 		return;
 	}
-
-	auto handler = *originalHandler;
 
 	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
 	{
@@ -366,12 +386,324 @@ static void FixPedCombatAttributes()
 	});
 }
 
+static int32_t g_maxHudColours;
+static void FixReplaceHudColour()
+{
+	constexpr uint64_t REPLACE_HUD_COLOUR = 0x1CCC708F0F850613;
+	constexpr uint64_t REPLACE_HUD_COLOUR_WITH_RGBA = 0xF314CF4F0211894E;
+
+	for (uint64_t nativeHash : { REPLACE_HUD_COLOUR, REPLACE_HUD_COLOUR_WITH_RGBA })
+	{
+		auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+		if (!handler)
+		{
+			continue;
+		}
+
+		fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
+		{
+			auto hudColorIndex = ctx.GetArgument<int32_t>(0);
+			if (hudColorIndex < 0 || hudColorIndex > g_maxHudColours)
+			{
+				fx::scripting::Warningf("natives", "Invalid HUD_COLOUR index was passed (%d), should be from 0 to %d\n", hudColorIndex, g_maxHudColours);
+				return;
+			}
+
+			handler(ctx);
+		});
+	}
+}
+
+static int32_t g_numMarkerTypes;
+static void FixDrawMarker()
+{
+	constexpr uint64_t DRAW_MARKER = 0x28477EC23D892089;
+	constexpr uint64_t DRAW_MARKER_EX = 0xE82728F0DE75D13A;
+
+	for (uint64_t nativeHash : { DRAW_MARKER, DRAW_MARKER_EX })
+	{
+		auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+		if (!handler)
+		{
+			continue;
+		}
+
+		fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
+		{
+			auto markerType = ctx.GetArgument<int32_t>(0);
+			if (markerType < 0 || markerType >= g_numMarkerTypes)
+			{
+				fx::scripting::Warningf("natives", "Invalid MARKER_TYPE index was passed (%d), should be from 0 to %d\n", markerType, g_numMarkerTypes - 1);
+				return;
+			}
+
+			handler(ctx);
+		});
+	}
+}
+
+static void FixApplyForceToEntity()
+{
+	// ApplyForceToEntity checks if the entity is valid, but then does some stuff outside of that check
+
+	constexpr const uint64_t nativeHash = 0xC5F68BE9613E2D18; // APPLY_FORCE_TO_ENTITY
+
+	const auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
+	{
+		const auto handle = ctx.GetArgument<uint32_t>(0);
+		const auto entity = rage::fwScriptGuid::GetBaseFromGuid(handle);
+
+		if (entity && entity->IsOfType<CPhysical>())
+		{
+			handler(ctx);
+		}
+	});
+}
+
+static void FixIsBitSet()
+{
+	constexpr const uint64_t nativeHash = 0xE2D0C323A1AE5D85; // IS_BIT_SET
+
+	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [](fx::ScriptContext& ctx)
+	{
+		bool result = false;
+
+		auto value = ctx.GetArgument<uint32_t>(0);
+		auto offset = ctx.GetArgument<int>(1);
+
+		if (offset < 32)
+		{
+			result = (value & (1 << offset)) != 0;
+		}
+
+		ctx.SetResult<int>(result);
+	});
+}
+
+static hook::cdecl_stub<bool(uint32_t* mi)> hasModelLoaded([]()
+{
+	return hook::get_call(hook::get_pattern("25 FF FF FF 3F 89 45 6F E8 ? ? ? ? 84 C0", 8));
+});
+
+static rage::CTrainConfigData* g_trainConfigData;
+
+static void FixMissionTrain()
+{
+	constexpr uint64_t CREATE_MISSION_TRAIN = 0x63C6CCA8E68AE8C8;
+
+	auto handler = fx::ScriptEngine::GetNativeHandler(CREATE_MISSION_TRAIN);
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(CREATE_MISSION_TRAIN, [handler](fx::ScriptContext& ctx)
+	{
+		auto variation = ctx.GetArgument<int>(0);
+
+		if (variation < 0 || variation >= g_trainConfigData->m_trainConfigs.GetCount())
+		{
+			fx::scripting::Warningf("natives", "Invalid train variation index was passed to CREATE_MISSION_TRAIN (%i), should be from 0 to %i\n", variation, g_trainConfigData->m_trainConfigs.GetCount() - 1);
+			ctx.SetResult<int>(0);
+			return;
+		}
+
+		rage::CTrainConfig config = g_trainConfigData->m_trainConfigs.Get(variation);
+
+		// Prevent the native from executing if one any of the required models are not in memory
+		for (auto& carriage : config.m_carriages)
+		{
+			rage::fwModelId idx{ 0 };
+			rage::fwArchetypeManager::GetArchetypeFromHashKey(carriage.m_hash, idx);
+			if (!hasModelLoaded(&idx.value))
+			{
+				fx::scripting::Warningf("natives", "Failed to spawn mission train as carriage hash '%i' is not loaded\n", carriage.m_hash);
+				ctx.SetResult<int>(0);
+				return;
+			}	
+		}
+
+		// Prevent the native from executing if there are no tracks available. This won't crash the game but can give a confusing error.
+		if (rage::CTrainTrack::AreAllTracksDisabled())
+		{
+			fx::scripting::Warningf("natives", "Failed to spawn mission train as there are no tracks enabled\n");
+			ctx.SetResult<int>(0);
+			return;
+		}
+
+		handler(ctx);
+	});
+}
+
+static void FixAddRopeNative()
+{
+	constexpr const uint64_t ADD_ROPE = 0xE832D760399EB220;
+	auto handler = fx::ScriptEngine::GetNativeHandler(ADD_ROPE);
+
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(ADD_ROPE, [handler](fx::ScriptContext& ctx)
+	{
+		rage::ropeDataManager* manager = rage::ropeDataManager::GetInstance();
+		if (manager)
+		{
+			auto ropeIndex = ctx.GetArgument<int>(7);
+			if (ropeIndex >= 0 && ropeIndex < manager->typeData.GetCount())
+			{
+				return handler(ctx);
+			}
+			else
+			{
+				fx::scripting::Warningf("natives", "Invalid rope type was passed to ADD_ROPE (%d), should be from 0 to %d\n", ropeIndex, manager->typeData.GetCount() - 1);
+			}
+		}
+		ctx.SetResult(0);
+	});
+}
+
+// PatchVehicleHoodCamera.cpp
+enum eVehicleType : uint32_t
+{
+	VEHICLE_TYPE_CAR = 0,
+	VEHICLE_TYPE_PLANE,
+	VEHICLE_TYPE_TRAILER,
+	VEHICLE_TYPE_QUADBIKE,
+	VEHICLE_TYPE_DRAFT,
+	VEHICLE_TYPE_SUBMARINECAR,
+	VEHICLE_TYPE_AMPHIBIOUS_AUTOMOBILE,
+	VEHICLE_TYPE_AMPHIBIOUS_QUADBIKE,
+	VEHICLE_TYPE_HELI,
+	VEHICLE_TYPE_BLIMP,
+	VEHICLE_TYPE_AUTOGYRO,
+	VEHICLE_TYPE_BIKE,
+	VEHICLE_TYPE_BICYCLE,
+	VEHICLE_TYPE_BOAT,
+	VEHICLE_TYPE_TRAIN,
+	VEHICLE_TYPE_SUBMARINE,
+};
+
+static int g_vehicleTypeOffset;
+
+using CHeli_BreakOffRotor_t = void(__fastcall*)(fwEntity* heli);
+static CHeli_BreakOffRotor_t CHeli_BreakOffMainRotor;
+static CHeli_BreakOffRotor_t CHeli_BreakOffTailRotor;
+
+static void SetHeliRotorHealthHandler(const uint64_t nativeHash, void(*breakOffRotorFunc)(rage::fwEntity*))
+{
+	auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler, breakOffRotorFunc](fx::ScriptContext& ctx)
+	{
+		handler(ctx);
+
+		const auto rotorHealth = ctx.GetArgument<float>(1);
+		if (rotorHealth > 0.0f && !std::isnan(rotorHealth))
+		{
+			return;
+		}
+
+		const auto vehicleHandle = ctx.GetArgument<uint32_t>(0);
+		const auto vehicle = rage::fwScriptGuid::GetBaseFromGuid(vehicleHandle);
+		if (vehicle && vehicle->IsOfType<CVehicle>())
+		{
+			const auto vehicleType = *reinterpret_cast<eVehicleType*>((char*)vehicle + g_vehicleTypeOffset);
+			if (vehicleType == VEHICLE_TYPE_HELI || vehicleType == VEHICLE_TYPE_BLIMP)
+			{
+				breakOffRotorFunc(vehicle);
+			}
+		}
+	});
+}
+
+static void FixSetHeliRotorHealth()
+{
+	constexpr uint64_t nativeHash = 0x4056EA1105F5ABD7; // _SET_HELI_MAIN_ROTOR_HEALTH
+	constexpr uint64_t nativeHash2 = 0xFE205F38AAA58E5B; // _SET_HELI_TAIL_ROTOR_HEALTH
+
+	SetHeliRotorHealthHandler(nativeHash, CHeli_BreakOffMainRotor);
+	SetHeliRotorHealthHandler(nativeHash2, CHeli_BreakOffTailRotor);
+}
+
+static void FixSetPlayerParachuteModelOverride()
+{
+	// Make SET_PLAYER_PARACHUTE_MODEL_OVERRIDE() use a whitelist of model hashes.
+	// This prevents a vulnerability that could cause a client to crash.
+
+	constexpr const uint64_t nativeHash = 0x977DB4641F6FC3DB; // SET_PLAYER_PARACHUTE_MODEL_OVERRIDE
+
+	const auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
+	{
+		uint32_t modelHash = ctx.GetArgument<uint32_t>(1);
+		if (IsParachuteModelAuthorized(modelHash))
+		{
+			handler(ctx);
+		}
+	});
+}
+
+static void FixSetPlayerParachutePackModelOverride()
+{
+	// Make SET_PLAYER_PARACHUTE_PACK_MODEL_OVERRIDE() use a whitelist of model hashes.
+	// This prevents a vulnerability that could cause a client to crash.
+
+	constexpr const uint64_t nativeHash = 0xDC80A4C2F18A2B64; // SET_PLAYER_PARACHUTE_PACK_MODEL_OVERRIDE
+
+	const auto handler = fx::ScriptEngine::GetNativeHandler(nativeHash);
+	if (!handler)
+	{
+		return;
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler(nativeHash, [handler](fx::ScriptContext& ctx)
+	{
+		uint32_t modelHash = ctx.GetArgument<uint32_t>(1);
+		if (IsParachutePackModelAuthorized(modelHash))
+		{
+			handler(ctx);
+		}
+	});
+}
+
 static HookFunction hookFunction([]()
 {
 	g_fireInstances = (std::array<FireInfoEntry, 128>*)(hook::get_address<uintptr_t>(hook::get_pattern("74 47 48 8D 0D ? ? ? ? 48 8B D3", 2), 3, 7) + 0x10);
+	g_maxHudColours = *hook::get_pattern<int32_t>("81 F9 ? ? ? ? 77 5A 48 89 5C 24", 2);
+	g_numMarkerTypes = *hook::get_pattern<int32_t>("BE FF FF FF DF 41 BF 00 00 FF 0F 41 BC FF FF FF BF", -4);
+	g_trainConfigData = hook::get_address<rage::CTrainConfigData*>(hook::get_pattern<rage::CTrainConfigData>("4C 8B 05 ? ? ? ? 0F 29 74 24 ? 48 8D 3C 40", 3));
+
+	// Stolen from "VehicleExtraNatives.cpp"
+	g_vehicleTypeOffset = *hook::get_pattern<int>("41 83 BF ? ? ? ? 0B 74", 3);
+
+	void* breakOffMainRotorAddress = hook::get_pattern("48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B B1 ? ? ? ? 0F BE B9 ? ? ? ? 48 8B D9 48 85 F6 0F 84");
+	CHeli_BreakOffMainRotor = reinterpret_cast<CHeli_BreakOffRotor_t>(breakOffMainRotorAddress);
+	void* breakOffTailRotorAddress = hook::get_pattern("48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B B1 ? ? ? ? 0F BE B9 ? ? ? ? 48 8B D9 48 85 F6 74");
+	CHeli_BreakOffTailRotor = reinterpret_cast<CHeli_BreakOffRotor_t>(breakOffTailRotorAddress);
 
 	rage::scrEngine::OnScriptInit.Connect([]()
 	{
+		BlockForbiddenNatives();
+
 		// Most of vehicle window related natives have no checks for passed window index is valid
 		// for specified vehicle, passing wrong values lead to native execution exception.
 		FixVehicleWindowNatives();
@@ -394,5 +726,26 @@ static HookFunction hookFunction([]()
 		FixStopEntityFire();
 
 		FixPedCombatAttributes();
+
+		FixReplaceHudColour();
+
+		FixDrawMarker();
+
+		FixApplyForceToEntity();
+
+		FixMissionTrain();
+
+		FixAddRopeNative();
+
+		FixSetHeliRotorHealth();
+
+		FixSetPlayerParachuteModelOverride();
+		FixSetPlayerParachutePackModelOverride();
+
+		if (xbr::IsGameBuildOrGreater<2612>())
+		{
+			// IS_BIT_SET is missing in b2612+, re-adding for compatibility
+			FixIsBitSet();
+		}
 	});
 });

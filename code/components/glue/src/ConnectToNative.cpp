@@ -52,8 +52,13 @@
 
 #include <MinMode.h>
 
+#include "CfxState.h"
 #include "GameInit.h"
 #include "CnlEndpoint.h"
+#include "PacketHandler.h"
+#include "PaymentRequest.h"
+
+#include "LinkProtocolIPC.h"
 
 #ifdef GTA_FIVE
 #include <ArchetypesCollector.h>
@@ -98,7 +103,18 @@ static void SaveBuildNumber(uint32_t build)
 	}
 }
 
-void RestartGameToOtherBuild(int build, int pureLevel)
+static void SaveGameSettings(const std::wstring& poolIncreases, bool replaceExecutable)
+{
+	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+
+	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		WritePrivateProfileString(L"Game", L"PoolSizesIncrease", poolIncreases.c_str(), fpath.c_str());
+		WritePrivateProfileString(L"Game", L"ReplaceExecutable", replaceExecutable ? L"1" : L"0", fpath.c_str());
+	}
+}
+
+void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
 {
 #if defined(GTA_FIVE) || defined(IS_RDR3)
 	SECURITY_ATTRIBUTES securityAttributes = { 0 };
@@ -107,31 +123,25 @@ void RestartGameToOtherBuild(int build, int pureLevel)
 	HANDLE switchEvent = CreateEventW(&securityAttributes, TRUE, FALSE, NULL);
 
 	static HostSharedData<CfxState> hostData("CfxInitState");
-	auto cli = fmt::sprintf(L"\"%s\" %s %s %s -switchcl:%d \"fivem://connect/%s\"",
+
+	auto cli = fmt::sprintf(L"\"%s\" %s %s %s -switchcl:%d \"%s://connect/%s\"",
 	hostData->gameExePath,
-	build == 1604 ? L"" : fmt::sprintf(L"-b%d", build),
+	fmt::sprintf(L"-b%d", build),
 	IsCL2() ? L"-cl2" : L"",
 	pureLevel == 0 ? L"" : fmt::sprintf(L"-pure_%d", pureLevel),
 	(uintptr_t)switchEvent,
+	hostData->GetLinkProtocol(),
 	ToWide(g_lastConn));
 
-	uint32_t defaultBuild =
-#ifdef GTA_FIVE
-	1604
-#elif defined(IS_RDR3)
-	1311
-#else
-	0
-#endif
-	;
-
 	// we won't launch the default build if we don't do this
-	if (build == defaultBuild)
+	if (build == xbr::GetDefaultGameBuild())
 	{
-		SaveBuildNumber(defaultBuild);
+		SaveBuildNumber(xbr::GetDefaultGameBuild());
 	}
 
-	trace("Switching from build %d to build %d...\n", xbr::GetGameBuild(), build);
+	SaveGameSettings(poolSizesIncreaseSetting, replaceExecutable);
+
+	trace("Switching from build %d to build %d...\n", xbr::GetRequestedGameBuild(), build);
 
 	SIZE_T size = 0;
 	InitializeProcThreadAttributeList(NULL, 1, 0, &size);
@@ -165,7 +175,7 @@ void RestartGameToOtherBuild(int build, int pureLevel)
 #endif
 }
 
-extern void InitializeBuildSwitch(int build, int pureLevel);
+extern void InitializeBuildSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable);
 
 void saveSettings(const wchar_t *json) {
 	PWSTR appDataPath;
@@ -372,7 +382,7 @@ static WRL::ComPtr<IShellLink> MakeShellLink(const ServerLink& link)
 		GetModuleFileNameEx(hProcess, NULL, imageFileName, std::size(imageFileName));
 
 		psl->SetPath(imageFileName);
-		psl->SetArguments(fmt::sprintf(L"%sfivem://connect/%s", buildArgument, ToWide(link.url)).c_str());
+		psl->SetArguments(fmt::sprintf(L"%s%s://connect/%s", buildArgument, hostData->GetLinkProtocol(), ToWide(link.url)).c_str());
 
 		WRL::ComPtr<IPropertyStore> pps;
 		psl.As(&pps);
@@ -518,9 +528,61 @@ static void DisconnectCmd()
 
 extern void MarkNuiLoaded();
 
+static std::function<void()> g_onYesCallback;
+
+class PaymentRequestPacketHandler : public net::PacketHandler<net::packet::ServerPaymentRequest, HashRageString("msgPaymentRequest")>
+{
+public:
+	template<typename T>
+	bool Process(T& stream)
+	{
+		return ProcessPacket(stream, [](net::packet::ServerPaymentRequest& serverPaymentRequest)
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(std::string(reinterpret_cast<const char*>(serverPaymentRequest.data.GetValue().data()), serverPaymentRequest.data.GetValue().size()));
+
+				se::ScopedPrincipal scope(se::Principal{ "system.console" });
+				console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->SetValue("0");
+				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "warningmessage", "PURCHASE REQUEST", fmt::sprintf("The server is requesting a purchase of %s for %s.", json.value("sku_name", ""), json.value("sku_price", "")), "Do you want to purchase this item?", "20" });
+
+				g_onYesCallback = [json]()
+				{
+					std::map<std::string, std::string> postMap;
+					postMap["data"] = json.value<std::string>("data", "");
+					postMap["sig"] = json.value<std::string>("sig", "");
+					postMap["clientId"] = g_discourseClientId;
+					postMap["userToken"] = g_discourseUserToken;
+
+					Instance<HttpClient>::Get()->DoPostRequest("https://keymaster.fivem.net/api/paymentAssign", postMap, [](bool success, const char* data, size_t length)
+					{
+						if (success)
+						{
+							auto res = nlohmann::json::parse(std::string(data, length));
+							auto url = res.value("url", "");
+
+							if (!url.empty())
+							{
+								if (url.find("http://") == 0 || url.find("https://") == 0)
+								{
+									ShellExecute(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+								}
+							}
+						}
+					});
+				};
+			}
+			catch (const std::exception& e)
+			{
+
+			}
+		});
+	}
+};
+
+
 static InitFunction initFunction([] ()
 {
-	static std::function<void()> g_onYesCallback;
 	static std::function<void()> backfillDoneEvent;
 	static bool mpMenuExpectsBackfill;
 	static bool disconnect;
@@ -617,9 +679,9 @@ static InitFunction initFunction([] ()
 			nui::PostRootMessage(fmt::sprintf(R"({ "type": "setServerAddress", "data": "%s" })", peerAddress));
 		});
 
-		netLibrary->OnRequestBuildSwitch.Connect([](int build, int pureLevel)
+		netLibrary->OnRequestBuildSwitch.Connect([](int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
 		{
-			InitializeBuildSwitch(build, pureLevel);
+			InitializeBuildSwitch(build, pureLevel, std::move(poolSizesIncreaseSetting), replaceExecutable);
 			g_connected = false;
 		});
 
@@ -764,47 +826,7 @@ static InitFunction initFunction([] ()
 			}
 		}, 5000);
 
-		lib->AddReliableHandler("msgPaymentRequest", [](const char* buf, size_t len)
-		{
-			try
-			{
-				auto json = nlohmann::json::parse(std::string(buf, len));
-
-				se::ScopedPrincipal scope(se::Principal{ "system.console" });
-				console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->SetValue("0");
-				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "warningmessage", "PURCHASE REQUEST", fmt::sprintf("The server is requesting a purchase of %s for %s.", json.value("sku_name", ""), json.value("sku_price", "")), "Do you want to purchase this item?", "20" });
-
-				g_onYesCallback = [json]()
-				{
-					std::map<std::string, std::string> postMap;
-					postMap["data"] = json.value<std::string>("data", "");
-					postMap["sig"] = json.value<std::string>("sig", "");
-					postMap["clientId"] = g_discourseClientId;
-					postMap["userToken"] = g_discourseUserToken;
-
-					Instance<HttpClient>::Get()->DoPostRequest("https://keymaster.fivem.net/api/paymentAssign", postMap, [](bool success, const char* data, size_t length)
-					{
-						if (success)
-						{
-							auto res = nlohmann::json::parse(std::string(data, length));
-							auto url = res.value("url", "");
-
-							if (!url.empty())
-							{
-								if (url.find("http://") == 0 || url.find("https://") == 0)
-								{
-									ShellExecute(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-								}
-							}
-						}
-					});
-				};
-			}
-			catch (const std::exception& e)
-			{
-
-			}
-		}, true);
+		lib->AddPacketHandler<PaymentRequestPacketHandler>(true);
 	});
 
 	OnMainGameFrame.Connect([]()
@@ -982,7 +1004,8 @@ static InitFunction initFunction([] ()
 
 	static ConVar<bool> uiPremium("ui_premium", ConVar_None, false);
 
-	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_None, curChannel,
+	// ConVar_ScriptRestricted because update channel is often misused as a marker for other things
+	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_ScriptRestricted, curChannel,
 	[](internal::ConsoleVariableEntry<std::string>* convar)
 	{
 		if (convar->GetValue() != curChannel)
@@ -1350,13 +1373,8 @@ static InitFunction initFunction([] ()
 #endif
 #include <shellapi.h>
 
-#include <nng/nng.h>
-#include <nng/protocol/pipeline0/pull.h>
-#include <nng/protocol/pipeline0/push.h>
-
-static void ProtocolRegister()
+static void ProtocolRegister(const wchar_t* name, const wchar_t* cls)
 {
-#ifdef GTA_FIVE
 	LSTATUS result;
 
 #define CHECK_STATUS(x) \
@@ -1368,47 +1386,55 @@ static void ProtocolRegister()
 
 	static HostSharedData<CfxState> hostData("CfxInitState");
 
-	HKEY key;
-	wchar_t command[1024];
-	swprintf_s(command, L"\"%s\" \"%%1\"", hostData->gameExePath);
+	HKEY key = NULL;
+	std::wstring command = fmt::sprintf(L"\"%s\" \"%%1\"", hostData->gameExePath);
 
-	CHECK_STATUS(RegCreateKeyW(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\fivem", &key));
-	CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)L"FiveM", 6 * 2));
-	CHECK_STATUS(RegSetValueExW(key, L"URL Protocol", 0, REG_SZ, (BYTE*)L"", 1 * 2));
+	const auto create_key = [&key](std::wstring name)
+	{
+		return RegCreateKeyW(HKEY_CURRENT_USER, name.c_str(), &key);
+	};
+
+	const auto set_string = [&key](const wchar_t* name, std::wstring value)
+	{
+		return RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value.c_str(), (value.size() + 1) * sizeof(wchar_t));
+	};
+
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\Classes\\%s", cls)));
+	CHECK_STATUS(set_string(NULL, name));
+	CHECK_STATUS(set_string(L"URL Protocol", L""));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\FiveM.ProtocolHandler", &key));
-	CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)L"FiveM", 6 * 2));
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\Classes\\%s.ProtocolHandler", name)));
+	CHECK_STATUS(set_string(NULL, name));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\FiveM", &key));
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\%s", name)));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\FiveM\\Capabilities", &key));
-	CHECK_STATUS(RegSetValueExW(key, L"ApplicationName", 0, REG_SZ, (BYTE*)L"FiveM", 6 * 2));
-	CHECK_STATUS(RegSetValueExW(key, L"ApplicationDescription", 0, REG_SZ, (BYTE*)L"FiveM", 6 * 2));
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\%s\\Capabilities", name)));
+	CHECK_STATUS(set_string(L"ApplicationName", name));
+	CHECK_STATUS(set_string(L"ApplicationDescription", name));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\FiveM\\Capabilities\\URLAssociations", &key));
-	CHECK_STATUS(RegSetValueExW(key, L"fivem", 0, REG_SZ, (BYTE*)L"FiveM.ProtocolHandler", 22 * 2));
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\%s\\Capabilities\\URLAssociations", name)));
+	CHECK_STATUS(set_string(cls, fmt::sprintf(L"%s.ProtocolHandler", name)));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\RegisteredApplications", &key));
-	CHECK_STATUS(RegSetValueExW(key, L"FiveM", 0, REG_SZ, (BYTE*)L"Software\\FiveM\\Capabilities", 28 * 2));
+	CHECK_STATUS(create_key(L"SOFTWARE\\RegisteredApplications"));
+	CHECK_STATUS(set_string(name, fmt::sprintf(L"Software\\%s\\Capabilities", name)));
 	CHECK_STATUS(RegCloseKey(key));
 
-	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\FiveM.ProtocolHandler\\shell\\open\\command", &key));
-	CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
+	CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\Classes\\%s.ProtocolHandler\\shell\\open\\command", name)));
+	CHECK_STATUS(set_string(NULL, command));
 	CHECK_STATUS(RegCloseKey(key));
 
 	if (!IsWindows8Point1OrGreater())
 	{
 		// these are for compatibility on downlevel Windows systems
-		CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\fivem\\shell\\open\\command", &key));
-		CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
+		CHECK_STATUS(create_key(fmt::sprintf(L"SOFTWARE\\Classes\\%s\\shell\\open\\command", cls)));
+		CHECK_STATUS(set_string(NULL, command));
 		CHECK_STATUS(RegCloseKey(key));
 	}
-#endif
 }
 
 void Component_RunPreInit()
@@ -1421,7 +1447,7 @@ void Component_RunPreInit()
 	if (hostData->IsMasterProcess())
 #endif
 	{
-		ProtocolRegister();
+		ProtocolRegister(PRODUCT_NAME, hostData->GetLinkProtocol());
 	}
 
 	int argc;
@@ -1431,11 +1457,13 @@ void Component_RunPreInit()
 	static std::string connectParams;
 	static std::string authPayload;
 
+	static auto protocolLinkStart = ToNarrow(hostData->GetLinkProtocol(L":"));
+
 	for (int i = 1; i < argc; i++)
 	{
 		std::string arg = ToNarrow(argv[i]);
 
-		if (arg.find("fivem:") == 0)
+		if (arg.find(protocolLinkStart) == 0)
 		{
 			auto parsed = skyr::make_url(arg);
 
@@ -1490,15 +1518,10 @@ void Component_RunPreInit()
 		}
 		else
 		{
-			nng_socket socket;
-			nng_dialer dialer;
-
 			auto j = nlohmann::json::object({ { "host", connectHost }, { "params", connectParams } });
 			std::string connectMsg = j.dump(-1, ' ', false, nlohmann::detail::error_handler_t::strict);
 
-			nng_push0_open(&socket);
-			nng_dial(socket, "ipc:///tmp/fivem_connect", &dialer, 0);
-			nng_send(socket, const_cast<char*>(connectMsg.c_str()), connectMsg.size(), 0);
+			cfx::glue::LinkProtocolIPC::SendConnectTo(connectMsg);
 
 			if (!hostData->gamePid)
 			{
@@ -1531,12 +1554,7 @@ void Component_RunPreInit()
 		}
 		else
 		{
-			nng_socket socket;
-			nng_dialer dialer;
-
-			nng_push0_open(&socket);
-			nng_dial(socket, "ipc:///tmp/fivem_auth", &dialer, 0);
-			nng_send(socket, const_cast<char*>(authPayload.c_str()), authPayload.size(), 0);
+			cfx::glue::LinkProtocolIPC::SendAuthPayload(authPayload);
 
 			if (!hostData->gamePid)
 			{
@@ -1552,29 +1570,42 @@ void Component_RunPreInit()
 	}
 }
 
-static InitFunction connectInitFunction([]()
-{
 #if __has_include(<gameSkeleton.h>)
+static InitFunction buildSaverInitFunction([]() {
 	rage::OnInitFunctionStart.Connect([](rage::InitFunctionType type)
 	{
 		if (type == rage::INIT_BEFORE_MAP_LOADED)
 		{
-			SaveBuildNumber(xbr::GetGameBuild());
+			SaveBuildNumber(xbr::GetRequestedGameBuild());
 		}
 	});
+});
 #endif
 
-	static nng_socket netSocket;
-	static nng_listener listener;
+static InitFunction linkProtocolIPCInitFunction([]()
+{
+	// Only run LinkProtocolIPC in the game process
+	if (!CfxState::Get()->IsGameProcess())
+	{
+		return;
+	}
 
-	nng_pull0_open(&netSocket);
-	nng_listen(netSocket, "ipc:///tmp/fivem_connect", &listener, 0);
+	cfx::glue::LinkProtocolIPC::Initialize();
 
-	static nng_socket netAuthSocket;
-	static nng_listener authListener;
+	cfx::glue::LinkProtocolIPC::OnConnectTo.Connect([](const std::string_view& connectMsg)
+	{
+		auto connectData = nlohmann::json::parse(connectMsg);
+		ConnectTo(connectData["host"], false, connectData["params"]);
 
-	nng_pull0_open(&netAuthSocket);
-	nng_listen(netAuthSocket, "ipc:///tmp/fivem_auth", &authListener, 0);
+		SetForegroundWindow(CoreGetGameWindow());
+	});
+
+	cfx::glue::LinkProtocolIPC::OnAuthPayload.Connect([](const std::string_view& authPayload)
+	{
+		HandleAuthPayload(std::string(authPayload));
+
+		SetForegroundWindow(CoreGetGameWindow());
+	});
 
 	GetEarlyGameFrame().Connect([]()
 	{
@@ -1583,34 +1614,6 @@ static InitFunction connectInitFunction([]()
 			return;
 		}
 
-		char* buffer;
-		size_t bufLen;
-
-		int err;
-
-		err = nng_recv(netSocket, &buffer, &bufLen, NNG_FLAG_NONBLOCK | NNG_FLAG_ALLOC);
-
-		if (err == 0)
-		{
-			std::string connectMsg(buffer, buffer + bufLen);
-			nng_free(buffer, bufLen);
-
-			auto connectData = nlohmann::json::parse(connectMsg);
-			ConnectTo(connectData["host"], false, connectData["params"]);
-
-			SetForegroundWindow(CoreGetGameWindow());
-		}
-
-		err = nng_recv(netAuthSocket, &buffer, &bufLen, NNG_FLAG_NONBLOCK | NNG_FLAG_ALLOC);
-
-		if (err == 0)
-		{
-			std::string msg(buffer, buffer + bufLen);
-			nng_free(buffer, bufLen);
-
-			HandleAuthPayload(msg);
-
-			SetForegroundWindow(CoreGetGameWindow());
-		}
+		cfx::glue::LinkProtocolIPC::ProcessMessages();
 	});
 });

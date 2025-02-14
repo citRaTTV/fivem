@@ -6,63 +6,76 @@
 #define XBR_BUILDS_ONLY
 #include <CrossBuildRuntime.h>
 
+#include <shellapi.h>
+#include <string>
+#include <sstream>
+
 void XBR_EarlySelect()
 {
-	uint32_t defaultBuild =
-#ifdef GTA_FIVE
-		1604
-#elif defined(IS_RDR3)
-		1311
-#elif defined(GTA_NY)
-		43
-#else
-		0
-#endif
-		;
-
-	// specify a different saved build for first runs in release to save download time for first launch
-	uint32_t initialBuild = defaultBuild;
-
-#ifndef _DEBUG
-#ifdef GTA_FIVE
-	initialBuild = 2699;
-#elif defined(IS_RDR3)
-	initialBuild = 1491;
-#endif
-#endif
-
 	// we *can't* call xbr:: APIs here since they'll `static`-initialize and break GameCache later
-	uint32_t builds[] = {
-#define EXPAND(_, __, x) x,
+	std::wstring_view builds[] = {
+#define EXPAND(_, __, x) \
+	BOOST_PP_WSTRINGIZE(BOOST_PP_CAT(-b, x)),
+
 		BOOST_PP_SEQ_FOR_EACH(EXPAND, , GAME_BUILDS)
 #undef EXPAND
 	};
 
-	uint32_t requestedBuild = defaultBuild;
-
 	auto state = CfxState::Get();
 	const auto realCli = (state->initCommandLine[0]) ? state->initCommandLine : GetCommandLineW();
 
-	for (uint32_t build : builds)
+	bool buildFlagFound = false;
+	std::wstring connectionBuildArg;
+
+	int argc;
+	wchar_t** wargv = CommandLineToArgvW(realCli, &argc);
+	for (int i = 1; i < argc; i++)
 	{
-		if (wcsstr(realCli, fmt::sprintf(L"b%d", build).c_str()) != nullptr)
+		std::wstring_view arg = wargv[i];
+
+		if (arg.find(L"://connect/") != std::wstring_view::npos)
 		{
-			requestedBuild = build;
-			break;
+			std::wstringstream ss(arg.data());
+			std::wstring connectionArg;
+			while (std::getline(ss, connectionArg, L'?'))
+			{
+				if (connectionArg.find(L"-b") == 0)
+				{
+					connectionBuildArg = connectionArg;
+				}
+			}
+		}
+
+		for (auto build : builds)
+		{
+			if (arg == build)
+			{
+				buildFlagFound = true;
+				break;
+			}
 		}
 	}
+	LocalFree(wargv);
 
-	if (requestedBuild == defaultBuild && state->IsMasterProcess())
+	if (buildFlagFound || !state->IsMasterProcess())
 	{
-		std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+		return;
+	}
 
-		auto retainedBuild = GetPrivateProfileInt(L"Game", L"SavedBuildNumber", initialBuild, fpath.c_str());
+	if (!connectionBuildArg.empty())
+	{
+		wcscat(state->initCommandLine, L" ");
+		wcscat(state->initCommandLine, connectionBuildArg.c_str());
+		return;
+	}
 
-		// wcsstr is in case we have a `b1604` argument e.g. and we therefore want to ignore the saved build
-		if (retainedBuild != defaultBuild && !wcsstr(realCli, va(L"b%d", defaultBuild)))
-		{
-			wcscat(state->initCommandLine, va(L" -b%d", retainedBuild));
-		}
+	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+	auto retainedBuild = GetPrivateProfileInt(L"Game", L"SavedBuildNumber", xbr::GetDefaultGameBuild(), fpath.c_str());
+
+	// If there is no explicit build flag and retained build is not default - add flag to command line.
+	if (retainedBuild != xbr::GetDefaultGameBuild())
+	{
+		wcscat(state->initCommandLine, va(L" -b%d", retainedBuild));
 	}
 }
 #endif

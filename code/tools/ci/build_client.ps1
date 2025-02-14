@@ -6,6 +6,7 @@ using module .\psm1\cfxPackClient.psm1
 using module .\psm1\cfxRunMSBuild.psm1
 using module .\psm1\cfxRunPrebuild.psm1
 using module .\psm1\cfxRunPremake.psm1
+using module .\psm1\cfxSetupBuildToolkit.psm1
 using module .\psm1\cfxSetupCEF.psm1
 using module .\psm1\cfxSetupPrivate.psm1
 using module .\psm1\cfxSetupSubmodules.psm1
@@ -24,11 +25,13 @@ try {
     $tools.ensureNodeJS()
     $tools.ensureYarn()
 
-    Write-Host "Context:", $ctx, "`n"
-    Write-Host "Tools:", $tools, "`n"
-    Write-Host "Versions:", $versions, "`n"
+    Write-Output "Context:", $ctx, "`n"
+    Write-Output "Tools:", $tools, "`n"
+    Write-Output "Versions:", $versions, "`n"
 
     $ctx.startBuild()
+
+    Invoke-CfxSetupBuildToolkit -Context $ctx
 
     Invoke-LogSection "Visual Studio Environment Setup" {
         Invoke-CfxSetupVS -Context $ctx -Tools $tools
@@ -72,7 +75,7 @@ try {
         Invoke-PackClient -Context $ctx -Tools $tools -Versions $versions
     }.GetNewClosure()
 
-    if ($ctx.IsReleaseBuild) {
+    if ($ctx.IsPublicBuild) {
         Invoke-LogSection "Creating sentry release" {
             $sentryVersion = "cfx-{0}" -f $versions.BuildID
 

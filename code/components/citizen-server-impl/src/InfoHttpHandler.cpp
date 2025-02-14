@@ -22,6 +22,9 @@
 
 #include <cfx_version.h>
 #include <optional>
+#include <skyr/v1/url.hpp>
+
+#include "ForceConsteval.h"
 
 using json = nlohmann::json;
 
@@ -134,15 +137,18 @@ struct InfoHttpHandlerComponentLocals : fwRefCountable
 	std::shared_ptr<ConVar<int>> maxClientsVar;
 	std::shared_ptr<ConVar<std::string>> iconVar;
 	std::shared_ptr<ConVar<std::string>> versionVar;
+	std::shared_ptr<ConVar<int>> versionBuildNoVar;
 	std::shared_ptr<ConsoleCommand> crashCmd;
 	int paranoiaLevel = 0;
 	std::shared_ptr<ConVar<int>> paranoiaVar;
 	std::shared_ptr<ConVar<bool>> epPrivacy;
+	std::shared_ptr<ConVar<bool>> exposePlayerIdentifiersInHttpEndpoint;
 	std::shared_ptr<InfoData> infoData;
 	std::shared_ptr<ConsoleCommand> iconCmd;
 
 	std::shared_mutex playerBlobMutex;
 	std::string playerBlob;
+	std::string publicPlayerBlob;
 
 	std::chrono::milliseconds nextPlayerUpdate{ 0 };
 
@@ -160,6 +166,9 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 	maxClientsVar = instance->AddVariable<int>("sv_maxClients", ConVar_ServerInfo, 30);
 	iconVar = instance->AddVariable<std::string>("sv_icon", ConVar_Internal, "");
 	versionVar = instance->AddVariable<std::string>("version", ConVar_Internal, "FXServer-" GIT_DESCRIPTION);
+	const char* lastPeriod = strrchr(GIT_TAG, '.');
+	int versionBuildNo = lastPeriod == nullptr ? 0 : strtol(lastPeriod + 1, nullptr, 10);
+	versionBuildNoVar = instance->AddVariable<int>("buildNumber", ConVar_Internal, versionBuildNo);
 	crashCmd = instance->AddCommand("_crash", []()
 	{
 		*(volatile int*)0 = 0;
@@ -167,6 +176,7 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 	paranoiaLevel = 0;
 	paranoiaVar = instance->AddVariable<int>("sv_requestParanoia", ConVar_None, 0, &paranoiaLevel);
 	epPrivacy = instance->AddVariable<bool>("sv_endpointPrivacy", ConVar_None, true);
+	exposePlayerIdentifiersInHttpEndpoint = instance->AddVariable<bool>("sv_exposePlayerIdentifiersInHttpEndpoint", ConVar_None, false);
 
 	auto processRequestParanoia = [this](const fwRefContainer<net::HttpRequest>& request)
 	{
@@ -359,8 +369,33 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 			return;
 		}
 
+		const auto server = instance->GetComponent<fx::GameServer>();
+
+		bool authorizedRequest = false;
+		if (const auto playersToken = request->GetHeader("X-Players-Token", ""); !playersToken.empty() && server->GetPlayersToken() == playersToken)
+		{
+			authorizedRequest = true;
+		}
+		
+		if (auto path = request->GetPath(); std::string_view{path.data(), path.size()}.rfind("/players.json", 0) == 0)
+		{
+			constexpr uint8_t pathLength = net::force_consteval<int, std::string_view("/players.json").size()>;
+			skyr::v1::url_search_parameters searchParameters (std::string_view{path.data() + pathLength, path.size() - pathLength});
+			if (auto token = searchParameters.get("token"); token.has_value() && !token.value().empty() && server->GetPlayersToken() == token.value())
+			{
+				authorizedRequest = true;
+			}
+		}
+
+		if (authorizedRequest)
+		{
+			std::shared_lock<std::shared_mutex> lock(playerBlobMutex);
+			response->End(playerBlob);
+			return;
+		}
+
 		std::shared_lock<std::shared_mutex> lock(playerBlobMutex);
-		response->End(playerBlob);
+		response->End(publicPlayerBlob);
 	});
 
 	instance->GetComponent<fx::GameServer>()->OnTick.Connect([this, instance]()
@@ -377,19 +412,20 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 		auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 
 		json data = json::array();
+		json publicData = json::array();
+
+		bool showEndpoint = !epPrivacy->GetValue();
+		const bool hidePlayerIdentifiers = !exposePlayerIdentifiersInHttpEndpoint->GetValue();
 
 		clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 		{
-			if (client->GetNetId() >= 0xFFFF)
+			if (!client->HasConnected())
 			{
 				return;
 			}
 
-			bool showEP = !epPrivacy->GetValue();
-
 			auto identifiers = client->GetIdentifiers();
-
-			if (!showEP)
+			if (!showEndpoint)
 			{
 				auto newEnd = std::remove_if(identifiers.begin(), identifiers.end(), [](const std::string& identifier)
 				{
@@ -403,17 +439,37 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 			gscomms_get_peer(client->GetPeer(), stackBuffer);
 			auto peer = stackBuffer.GetBase();
 
-			data.push_back({
-				{ "endpoint", (showEP) ? client->GetAddress().ToString() : "127.0.0.1" },
+			auto playerData = json::object({
+				{ "endpoint", (showEndpoint) ? client->GetAddress().ToString() : "127.0.0.1" },
 				{ "id", client->GetNetId() },
-				{ "identifiers", identifiers },
+				{ "identifiers", json::array() },
 				{ "name", client->GetName() },
 				{ "ping", peer ? peer->GetPing() : -1 }
 			});
+
+			// pushes the player data without identifiers to the public api
+			publicData.push_back(playerData);
+
+			auto privatePlayerData = playerData;
+
+			// adds the identifiers
+			privatePlayerData["identifiers"] = identifiers;
+
+			// pushes the player data with identifiers to the private api
+			data.push_back(privatePlayerData);
 		});
 
 		std::unique_lock<std::shared_mutex> lock(playerBlobMutex);
 		playerBlob = data.dump(-1, ' ', false, json::error_handler_t::replace);
+
+		if (hidePlayerIdentifiers)
+		{
+			publicPlayerBlob = publicData.dump(-1, ' ', false, json::error_handler_t::replace);
+		}
+		else
+		{
+			publicPlayerBlob = playerBlob;
+		}
 	});
 
 	static std::optional<json> lastProfile;
@@ -426,13 +482,47 @@ void InfoHttpHandlerComponentLocals::AttachToObject(fx::ServerInstanceBase* inst
 			
 		if (baseUrl)
 		{
-			console::Printf("profiler", "You can view the recorded profile data at ^4%s?loadTimelineFromURL=https://%s/profileData.json^7 in Chrome (or compatible).\n",
-				fx::ProfilerComponent::GetDevToolsURL(), baseUrl->GetValue());
+			const auto server = instance->GetComponent<fx::GameServer>();
+
+			std::string authentication{};
+
+			if (!server->GetProfileDataToken().empty())
+			{
+				authentication = "?token=" + server->GetProfileDataToken();
+			}
+
+			console::Printf("profiler", "You can view the recorded profile data at ^4%s?loadTimelineFromURL=https://%s/profileData.json%s^7 in Chrome (or compatible).\n",
+				fx::ProfilerComponent::GetDevToolsURL(), baseUrl->GetValue(), authentication.c_str());
 		}
 	});
 
-	instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/profileData.json", [=](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response)
+	instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/profileData.json", [this, instance](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response)
 	{
+		const auto server = instance->GetComponent<fx::GameServer>();
+
+		bool needsAuthorization = !server->GetProfileDataToken().empty();
+		bool authorizedRequest = false;
+
+		if (needsAuthorization)
+		{
+			if (auto path = request->GetPath(); std::string_view{path.data(), path.size()}.rfind("/profileData.json", 0) == 0)
+			{
+				constexpr uint8_t pathLength = net::force_consteval<int, std::string_view("/profileData.json").size()>;
+				skyr::v1::url_search_parameters searchParameters (std::string_view{path.data() + pathLength, path.size() - pathLength});
+				if (auto token = searchParameters.get("token"); token.has_value() && server->GetProfileDataToken() == token.value())
+				{
+					authorizedRequest = true;
+				}
+			}
+
+			if (!authorizedRequest)
+			{
+				response->SetStatusCode(401);
+				response->End("Unauthorized");
+				return;
+			}
+		}
+
 		if (!lastProfile)
 		{
 			response->SetStatusCode(404);
@@ -473,21 +563,11 @@ json InfoHttpHandlerComponentLocals::GetDynamicJson()
 {
 	auto server = m_instance->GetComponent<fx::GameServer>();
 
-	int numClients = 0;
-
-	m_instance->GetComponent<fx::ClientRegistry>()->ForAllClients([&](const fx::ClientSharedPtr& client)
-	{
-		if (client->GetNetId() < 0xFFFF)
-		{
-			++numClients;
-		}
-	});
-
 	auto json = json::object({
 		{ "hostname", server->GetVariable("sv_hostname") },
 		{ "gametype", server->GetVariable("gametype") },
 		{ "mapname", server->GetVariable("mapname") },
-		{ "clients", numClients },
+		{ "clients", m_instance->GetComponent<fx::ClientRegistry>()->GetAmountOfConnectedClients() },
 		{ "iv", server->GetVariable("sv_infoVersion") },
 		{ "sv_maxclients", server->GetVariable("sv_maxclients") },
 	});

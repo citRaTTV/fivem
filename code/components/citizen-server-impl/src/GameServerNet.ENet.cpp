@@ -17,6 +17,9 @@
 #include <enet/enet.h>
 
 #include <FixedBuffer.h>
+#include <net/PacketNames.h>
+
+#include "ENetPacketUniquePtr.h"
 
 namespace fx
 {
@@ -242,8 +245,9 @@ namespace fx
 					auto peerId = static_cast<int>(reinterpret_cast<uintptr_t>(event.peer->data));
 
 					NetPeerImplENet netPeer(this, peerId);
-					m_server->ProcessPacket(&netPeer, event.packet->data, event.packet->dataLength);
-					enet_packet_destroy(event.packet);
+
+					ENetPacketPtr packet (event.packet, ENetPacketDeleter{});
+					m_server->ProcessPacket(&netPeer, packet);
 					break;
 				}
 				}
@@ -313,6 +317,17 @@ namespace fx
 					if (info.type == HashRageString("msgNetEvent"))
 					{
 						info.eventName = std::string{ (const char*)packet->data + 8 };
+					}
+					else
+					{
+						for (const auto hash : net::PacketNames)
+						{
+							if (hash.first == info.type)
+							{
+								info.eventName = std::string{ hash.second };
+								break;
+							}
+						}
 					}
 
 					if (auto outIt = outgoingCommandsMap.find(packet); outIt != outgoingCommandsMap.end())

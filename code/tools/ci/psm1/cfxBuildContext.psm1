@@ -1,9 +1,10 @@
-using module .\cfxInterBuildCache.psm1
-
 class CfxBuildContext {
     [string] $ProjectRoot
 
-    [boolean] $IsReleaseBuild
+    [boolean] $IsDryRun
+    [boolean] $IsPublicBuild
+    [boolean] $IsRetailBuild
+    [boolean] $IsFeatureBranchBuild
 
     [string] $ProductName
     [string] $ProductExeName
@@ -31,6 +32,9 @@ class CfxBuildContext {
 
     [string] $PrivateRoot = ""
     [string] $PrivateUri = ""
+
+    [string] $ToolkitRoot = ""
+    [string] $ToolkitUri = ""
 
     [string] $SentryOrgName = "citizenfx"
     [string] $SentryProjectName
@@ -101,7 +105,11 @@ function Get-CfxBuildContext {
 
     $ctx.ProjectRoot = $env:CI_PROJECT_DIR -replace '/', '\'
 
-    $ctx.IsReleaseBuild = $env:CFX_RELEASE_BUILD -eq "true"
+    $ctx.IsDryRun = $env:CFX_DRY_RUN -eq "true"
+    $ctx.IsRetailBuild = $env:CFX_RETAIL_BUILD -eq "true"
+    $ctx.IsFeatureBranchBuild = $env:CFX_FEATURE_BRANCH_BUILD -eq "true"
+
+    $ctx.IsPublicBuild = $ctx.IsRetailBuild -or $ctx.IsFeatureBranchBuild
 
     # Perform basic checks
     if (!(Test-Path $ctx.ProjectRoot)) {
@@ -111,12 +119,7 @@ function Get-CfxBuildContext {
         throw "CI did not provide the branch name"
     }
 
-    # Figure out build cache root
-    if ($env:CFX_USE_INTER_BUILD_CACHE -eq "true") {
-        $ctx.BuildCacheRoot = Get-InterBuildCache -ProjectRoot $ctx.ProjectRoot
-    } else {
-        $ctx.BuildCacheRoot = [IO.Path]::GetFullPath($ctx.getPathInProject(".build-cache"))
-    }
+    $ctx.BuildCacheRoot = [IO.Path]::GetFullPath($ctx.getPathInProject(".build-cache"))
 
     $ctx.CodeRoot = $ctx.getPathInProject("code")
     $ctx.CachesRoot = $ctx.getPathInProject("caches")
@@ -130,8 +133,17 @@ function Get-CfxBuildContext {
         $ctx.PrivateRoot = $ctx.getPathInBuildCache("fivem-private")
         $ctx.PrivateUri = $env:FIVEM_PRIVATE_URI
     }
-    elseif ($ctx.IsReleaseBuild) {
-        throw "Release build requires FIVEM_PRIVATE_URI env var to be defined"
+    elseif ($ctx.IsPublicBuild) {
+        throw "Public build requires FIVEM_PRIVATE_URI env var to be defined"
+    }
+
+    # Figure out toolkit
+    if ($env:CFX_BUILD_TOOLKIT_URI) {
+        $ctx.ToolkitRoot = $ctx.getPathInBuildCache("cfx-build-toolkit")
+        $ctx.ToolkitUri = $env:CFX_BUILD_TOOLKIT_URI
+    }
+    elseif ($ctx.IsPublicBuild) {
+        throw "Public build requires CFX_BUILD_TOOLKIT_URI env var to be defined"
     }
 
     $premakeDirSubpath = ""
@@ -143,7 +155,7 @@ function Get-CfxBuildContext {
             $ctx.ProductName = "fivem"
             $ctx.ProductExeName = "FiveM.exe"
             $ctx.PremakeGameName = "five"
-            $ctx.SentryProjectName = "fivem-client-1604"
+            $ctx.SentryProjectName = Get-EnvOrDefault $env:CFX_SENTRY_PROJECT_NAME_FIVEM "fivem-client-1604"
 
             break
         }
@@ -153,7 +165,7 @@ function Get-CfxBuildContext {
             $ctx.ProductName = "redm"
             $ctx.ProductExeName = "CitiLaunch.exe"
             $ctx.PremakeGameName = "rdr3"
-            $ctx.SentryProjectName = "redm"
+            $ctx.SentryProjectName = Get-EnvOrDefault $env:CFX_SENTRY_PROJECT_NAME_REDM "redm"
 
             break
         }
@@ -163,7 +175,7 @@ function Get-CfxBuildContext {
             $ctx.ProductName = "fxserver"
             $ctx.ProductExeName = "FXServer.exe"
             $ctx.PremakeGameName = "server"
-            $ctx.SentryProjectName = "fxserver"
+            $ctx.SentryProjectName = Get-EnvOrDefault $env:CFX_SENTRY_PROJECT_NAME_FXSERVER "fxserver"
 
             $premakeDirSubpath = "windows\"
 
@@ -180,4 +192,17 @@ function Get-CfxBuildContext {
     $ctx.MSBuildSolution = [IO.Path]::Combine($ctx.PremakeBuildDir, $ctx.PremakeGameName, $premakeDirSubpath + "CitizenMP.sln")
 
     return $ctx
+}
+
+function Get-EnvOrDefault {
+    param(
+        [string] $Value,
+        [string] $Default
+    )
+
+    if ($Value) {
+        return $Value
+    }
+
+    return $Default
 }

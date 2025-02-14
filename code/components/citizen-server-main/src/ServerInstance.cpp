@@ -36,6 +36,7 @@ static std::set<std::string, console::IgnoreCaseLess> setList =
 	"onesync_enableBeyond",
 	"gamename",
 	"sv_enforceGameBuild",
+	"sv_replaceExeToSwitchBuilds",
 	"sv_licenseKey",
 	"resources_useSystemChat",
 };
@@ -226,7 +227,6 @@ namespace fx
 				se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
 
 				// start standard resources
-				//consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "webadmin" });
 				if (console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("txAdminServerMode"))
 				{
 					consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "monitor" });
@@ -249,6 +249,12 @@ namespace fx
 				consoleCtx->GetVariableManager()->ShouldSuppressReadOnlyWarning(false);
 
 				OnInitialConfiguration();
+
+				console::PrintWarning(
+					_CFX_NAME_STRING(_CFX_COMPONENT_NAME),
+					"The players.json endpoint has been modified to no longer return the player identifiers without authentication.\n"
+					"To learn more about this change read our announcement at https://forum.cfx.re/t/celebrating-one-year-with-rockstar-games/5269938#fivem-and-redm-6\n"
+				);
 			});
 		}
 

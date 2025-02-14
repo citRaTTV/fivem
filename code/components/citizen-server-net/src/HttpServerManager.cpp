@@ -46,6 +46,10 @@ namespace fx
 					{
 						lock.unlock();
 
+						// to prevent a long running handler from timeouting the connection
+						// this timeout is overwritten when the response is send
+						response->StartConnectionTimeout(std::chrono::seconds{ m_handlerConnectionTimeout });
+
 						handler(request, response);
 						return true;
 					}
@@ -87,6 +91,8 @@ namespace fx
 	void HttpServerManager::AttachToObject(ServerInstanceBase* instance)
 	{
 		fwRefContainer<fx::TcpListenManager> listenManager = instance->GetComponent<fx::TcpListenManager>();
+
+		m_Http2Var = instance->AddVariable<bool>("sv_netHttp2", ConVar_None, false);
 
 		listenManager->OnInitializeMultiplexServer.Connect([=](fwRefContainer<net::MultiplexTcpServer> server)
 		{
@@ -165,9 +171,17 @@ namespace fx
 
 			tlsServer->AddRef();
 
-			tlsServer->SetProtocolList({ "h2", "http/1.1" });
+			if (m_Http2Var->GetValue())
+			{
+				tlsServer->SetProtocolList({ "h2", "http/1.1" });
 
-			m_http2Server->AttachToServer(tlsServer->GetProtocolServer("h2"));
+				m_http2Server->AttachToServer(tlsServer->GetProtocolServer("h2"));
+			}
+			else
+			{
+				tlsServer->SetProtocolList({ "http/1.1" });
+			}
+
 			m_httpServer->AttachToServer(tlsServer->GetProtocolServer("http/1.1"));
 
 			// create a TLS multiplex for the default protocol
@@ -190,6 +204,10 @@ static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
 	{
-		instance->SetComponent(new fx::HttpServerManager());
+		fx::HttpServerManager* httpServerManager = new fx::HttpServerManager();
+
+		static ConVar<uint16_t> svHttpHandlerConnectionTimeout(console::GetDefaultContext(), "sv_httpHandlerConnectionTimeoutSeconds", ConVar_None, 300, httpServerManager->GetHandlerConnectionTimeoutSeconds());
+
+		instance->SetComponent<fx::HttpServerManager>(httpServerManager);
 	}, -100);
 });

@@ -122,8 +122,19 @@ void DLLError(DWORD errorCode, std::string_view dllName)
 		win32::FormatMessage(errorCode));
 }
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
+#include "OSChecks.h"
+#endif
+
 int RealMain()
 {
+#ifdef LAUNCHER_PERSONALITY_MAIN
+	if (!EnsureCompatibleOSVersion())
+	{
+		return 100;
+	}
+#endif
+
 	if (auto setSearchPathMode = (decltype(&SetSearchPathMode))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetSearchPathMode"))
 	{
 		setSearchPathMode(BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE | BASE_SEARCH_PATH_PERMANENT);
@@ -256,6 +267,9 @@ int RealMain()
 	// initialize our initState instance
 	// this needs to be before *any* MakeRelativeCitPath use in main process
 	HostSharedData<CfxState> initState("CfxInitState");
+
+	// set link protocol, e.g. fivem or redm
+	initState->SetLinkProtocol(LINK_PROTOCOL);
 
 	// path environment appending of our primary directories
 	static wchar_t pathBuf[32768];
@@ -493,10 +507,10 @@ int RealMain()
 		L"\\dsound.dll", // breaks DSound init in game code
 
 		// X360CE v3 is buggy with COM hooks
-		L"\\xinput9_1_0.dll",
-		L"\\xinput1_1.dll",
-		L"\\xinput1_2.dll",
-		L"\\xinput1_3.dll",
+		//L"\\xinput9_1_0.dll",
+		//L"\\xinput1_1.dll",
+		//L"\\xinput1_2.dll",
+		//L"\\xinput1_3.dll",
 		L"\\xinput1_4.dll",
 
 		// packed DLL commonly shipping with RDR mods
@@ -562,8 +576,8 @@ int RealMain()
 
 			if (wcsstr(fxApplicationName, L"subprocess") == nullptr)
 			{
-				// and not a fivem:// protocol handler
-				if (wcsstr(GetCommandLineW(), L"fivem://") == nullptr)
+				// and not a protocol handler
+				if (wcsstr(GetCommandLineW(), initState->GetLinkProtocol(L"://")) == nullptr)
 				{
 					return 0;
 				}

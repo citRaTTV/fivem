@@ -58,11 +58,11 @@ namespace game
 	}
 }
 
-static inline void PatchTextChatCheck(const hook::pattern_match& match)
+static inline void PatchTextChatCheck(const hook::pattern_match& match, uint32_t offset)
 {
 	auto location = match.get<char>();
-	hook::nop(location, 10);
-	hook::put<uint8_t>(location + 10, 0xEB);
+	hook::nop(location, offset);
+	hook::put<uint8_t>(location + offset, 0xEB);
 }
 
 static HookFunction hookFunction([] ()
@@ -96,11 +96,32 @@ static HookFunction hookFunction([] ()
 	}
 #else
 	{
+		void* disableChatFunc = nullptr;
+		if (xbr::IsGameBuildOrGreater<3258>())
+		{
+			disableChatFunc = hook::get_pattern("48 89 5C 24 ? 57 48 83 EC ? 48 8D ? ? 48 8B ? 48 8B ? E8 ? ? ? ? 84 C0 75");
+		}
+		else if (xbr::IsGameBuildOrGreater<2372>())
+		{
+			disableChatFunc = hook::get_pattern("84 C0 75 04 B0 01 EB 23", -0x19);
+		}
+		else
+		{
+			disableChatFunc = hook::get_pattern("32 DB 84 C0 74 2D 48 8B", -0x22);
+		}
+
 		MH_Initialize();
-		MH_CreateHook((xbr::IsGameBuildOrGreater<2372>()) ? hook::get_pattern("84 C0 75 04 B0 01 EB 23", -0x19) : hook::get_pattern("32 DB 84 C0 74 2D 48 8B", -0x22), TextChatShutdownWrap, (void**)&g_origTextChatShutdown);
+		MH_CreateHook(disableChatFunc, TextChatShutdownWrap, (void**)&g_origTextChatShutdown);
 		MH_EnableHook(MH_ALL_HOOKS);
 
-		g_textChat = hook::get_address<void**>(hook::get_pattern("75 5D 48 8B 05 ? ? ? ? 44 38 60 14", 5));
+		if (xbr::IsGameBuildOrGreater<3095>())
+		{
+			g_textChat = hook::get_address<void**>(hook::get_pattern("75 61 48 8B 0D ? ? ? ? 38 59 14", 5));
+		}
+		else
+		{
+			g_textChat = hook::get_address<void**>(hook::get_pattern("75 5D 48 8B 05 ? ? ? ? 44 38 60 14", 5));
+		}
 	}
 #endif
 
@@ -110,10 +131,15 @@ static HookFunction hookFunction([] ()
 	hook::call(func, WrapInputCheck);
 
 	// some task checks for text chat that shouldn't *really* be needed... we hope.
-	if (xbr::IsGameBuildOrGreater<2944>())
+	if (xbr::IsGameBuildOrGreater<3095>())
 	{
-		PatchTextChatCheck(hook::pattern("44 38 60 14 75 06 44 39 60 04 74").count(1).get(0));
-		PatchTextChatCheck(hook::pattern("80 78 14 00 75 06 83 78 04 00 74 18").count(1).get(0));
+		PatchTextChatCheck(hook::pattern("40 38 70 14 75 05 39 70 04 74").count(1).get(0), 9);
+		PatchTextChatCheck(hook::pattern("80 78 14 00 75 06 83 78 04 00 74 18").count(1).get(0), 10);
+	}
+	else if (xbr::IsGameBuildOrGreater<2944>())
+	{
+		PatchTextChatCheck(hook::pattern("44 38 60 14 75 06 44 39 60 04 74").count(1).get(0), 10);
+		PatchTextChatCheck(hook::pattern("80 78 14 00 75 06 83 78 04 00 74 18").count(1).get(0), 10);
 	}
 	else
 	{
@@ -121,7 +147,7 @@ static HookFunction hookFunction([] ()
 
 		for (int i = 0; i < pattern.size(); i++)
 		{
-			PatchTextChatCheck(pattern.get(i));
+			PatchTextChatCheck(pattern.get(i), 10);
 		}	
 	}
 

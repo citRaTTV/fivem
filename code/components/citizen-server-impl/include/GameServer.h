@@ -26,6 +26,11 @@
 #include <citizen_util/detached_queue.h>
 #include <citizen_util/object_pool.h>
 
+#include <ClientDropReasons.h>
+
+#include "ByteReader.h"
+#include "ENetPacketUniquePtr.h"
+
 #ifdef COMPILING_CITIZEN_SERVER_IMPL
 #define SVIMP_EXPORT DLL_EXPORT
 #else
@@ -68,16 +73,27 @@ namespace fx
 
 		virtual std::string GetVariable(const std::string& key);
 
-		virtual void DropClientv(const fx::ClientSharedPtr& client, const std::string& reason, fmt::printf_args args);
+		virtual void DropClientv(const fx::ClientSharedPtr& client, const std::string& resourceName, ClientDropReason clientDropReason, const std::string& reason);
+
+		void DropClientWithReason(const fx::ClientSharedPtr& client, const std::string& resourceName, ClientDropReason clientDropReason, const std::string& reason)
+		{
+			DropClientv(client, resourceName, clientDropReason, reason);
+		}
 
 		template<typename... TArgs>
-		inline void DropClient(const fx::ClientSharedPtr& client, const std::string& reason, const TArgs&... args)
+		void DropClientWithReason(const fx::ClientSharedPtr& client, const std::string& resourceName, ClientDropReason clientDropReason, const std::string& reason, const TArgs&... args)
 		{
-			DropClientv(client, reason, fmt::make_printf_args(args...));
+			DropClientv(client, resourceName, clientDropReason, fmt::vsprintf(reason, fmt::make_printf_args(args...)));
+		}
+
+		template<typename... TArgs>
+		void DropClient(const fx::ClientSharedPtr& client, const std::string& reason, const TArgs&... args)
+		{
+			DropClientv(client, fx::serverDropResourceName, ClientDropReason::SERVER, fmt::vsprintf(reason, fmt::make_printf_args(args...)));
 		}
 
 	private:
-		void DropClientInternal(const fx::ClientSharedPtr& client, const std::string& reason);
+		void DropClientInternal(const fx::ClientSharedPtr& client, const std::string& resourceName, ClientDropReason clientDropReason, const std::string& reason);
 
 	public:
 		void ForceHeartbeat();
@@ -103,6 +119,16 @@ namespace fx
 		inline std::string GetRconPassword()
 		{
 			return m_rconPassword->GetValue();
+		}
+
+		inline std::string GetPlayersToken()
+		{
+			return m_playersToken->GetValue();
+		}
+
+		inline std::string GetProfileDataToken()
+		{
+			return m_profileDataToken->GetValue();
 		}
 
 		inline int GetNetLibVersion()
@@ -203,10 +229,10 @@ namespace fx
 		void Run();
 
 	public:
-		void ProcessPacket(NetPeerBase* peer, const uint8_t* data, size_t size);
+		void ProcessPacket(NetPeerBase* peer, ENetPacketPtr& packet);
 
 	public:
-		using TPacketHandler = std::function<void(uint32_t packetId, const fx::ClientSharedPtr& client, net::Buffer& packet)>;
+		using TPacketHandler = std::function<void(uint32_t packetId, const fx::ClientSharedPtr& client, net::ByteReader& packet, ENetPacketPtr& packetPtr)>;
 
 		inline void SetPacketHandler(const TPacketHandler& handler)
 		{
@@ -273,6 +299,10 @@ namespace fx
 
 		std::shared_ptr<ConVar<std::string>> m_rconPassword;
 
+		std::shared_ptr<ConVar<std::string>> m_playersToken;
+		
+		std::shared_ptr<ConVar<std::string>> m_profileDataToken;
+
 		std::shared_ptr<ConVar<std::string>> m_hostname;
 
 		std::shared_ptr<ConVar<GameName>> m_gamename;
@@ -314,7 +344,7 @@ namespace fx
 		detached_mpsc_queue<GameServerPacket> m_netSendList;
 	};
 
-	using TPacketTypeHandler = std::function<void(const fx::ClientSharedPtr& client, net::Buffer& packet)>;
+	using TPacketTypeHandler = std::function<void(const fx::ClientSharedPtr& client, net::ByteReader& reader, ENetPacketPtr packet)>;
 
 	enum class ThreadIdx
 	{
@@ -350,10 +380,13 @@ namespace fx
 	SVIMP_EXPORT bool IsBigMode();
 	SVIMP_EXPORT bool IsOneSync();
 	SVIMP_EXPORT bool IsLengthHack();
+	SVIMP_EXPORT bool IsOneSyncPopulation();
 	SVIMP_EXPORT void SetOneSyncGetCallback(bool (*cb)());
 	SVIMP_EXPORT void SetBigModeHack(bool bigMode, bool lengthHack);
+	SVIMP_EXPORT void SetOneSyncPopulation(bool population);
 	SVIMP_EXPORT std::string_view GetEnforcedGameBuild();
 	SVIMP_EXPORT int GetEnforcedGameBuildNumber();
+	SVIMP_EXPORT bool GetReplaceExecutable();
 }
 
 DECLARE_INSTANCE_TYPE(fx::GameServer);

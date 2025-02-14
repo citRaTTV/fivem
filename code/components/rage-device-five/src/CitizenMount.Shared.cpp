@@ -15,8 +15,6 @@
 #include <openssl/sha.h>
 #endif
 
-#include <LaunchMode.h>
-
 #include <VFSManager.h>
 #include <VFSRagePackfile7.h>
 #include <RelativeDevice.h>
@@ -83,7 +81,7 @@ public:
 		return false;
 	}
 
-	virtual THandle Open(const std::string& fileName, bool readOnly) override
+	virtual THandle Open(const std::string& fileName, bool readOnly, bool append = false) override
 	{
 		if (FilterFile(fileName))
 		{

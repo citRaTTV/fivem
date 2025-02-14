@@ -18,12 +18,16 @@
 
 #include <fxScripting.h>
 
+#include <ScriptInvoker.h>
+
 #include <Resource.h>
 #include <ManifestVersion.h>
 
 #include <om/OMComponent.h>
 
 #include <lua.hpp>
+
+#include "ComponentExport.h"
 
 // Linkage specified in lua.hpp to include/link-against internal structure
 // definitions. Note, for ELF builds LUAI_FUNC will mark the function as hidden.
@@ -63,41 +67,10 @@ enum class LuaProfilingMode : uint8_t
 	Shutdown,
 };
 
-enum class LuaMetaFields : uint8_t
-{
-	PointerValueInt,
-	PointerValueFloat,
-	PointerValueVector,
-	ReturnResultAnyway,
-	ResultAsInteger,
-	ResultAsLong,
-	ResultAsFloat,
-	ResultAsString,
-	ResultAsVector,
-	ResultAsObject,
-	AwaitSentinel,
-	Max
-};
-
 /// <summary>
 /// </summary>
 namespace fx
 {
-struct PointerFieldEntry
-{
-	bool empty;
-	uintptr_t value;
-	PointerFieldEntry()
-		: empty(true), value(0)
-	{
-	}
-};
-
-struct PointerField
-{
-	PointerFieldEntry data[64];
-};
-
 #if LUA_VERSION_NUM >= 504 && defined(_WIN32)
 #define LUA_USE_RPMALLOC
 #endif
@@ -111,12 +84,12 @@ private:
 	/// <summary>
 	/// Create a lua_State instance with a rpmalloc allocator.
 	/// </summary>
-	static lua_State* lua_rpmalloc_state(void*& opaque);
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA) lua_State* lua_rpmalloc_state(void*& opaque);
 
 	/// <summary>
 	/// Free/Dispose any additional resources associated with the Lua state.
 	/// </summary>
-	static void lua_rpmalloc_free(void* opaque);
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA) void lua_rpmalloc_free(void* opaque);
 
 	/// <summary>
 	/// Reference to the heap_t pointer. At the time of destruction lua_getallocf
@@ -173,7 +146,7 @@ class LuaScriptRuntime : public OMClass<LuaScriptRuntime, IScriptRuntime, IScrip
 private:
 	typedef std::function<void(const char*, const char*, size_t, const char*)> TEventRoutine;
 
-	typedef std::function<void(int32_t, const char*, size_t, char**, size_t*)> TCallRefRoutine;
+	typedef std::function<fx::OMPtr<IScriptBuffer>(int32_t, const char*, size_t)> TCallRefRoutine;
 
 	typedef std::function<int32_t(int32_t)> TDuplicateRefRoutine;
 
@@ -215,8 +188,6 @@ private:
 	int m_boundaryRoutine = 0;
 
 	void* m_parentObject = nullptr;
-
-	PointerField m_pointerFields[3];
 
 	int m_instanceId;
 
@@ -334,15 +305,15 @@ public:
 		return m_bookmarkHost;
 	}
 
-	LUA_INLINE PointerField* GetPointerFields()
-	{
-		return m_pointerFields;
-	}
-
 	LUA_INLINE const char* GetResourceName()
 	{
-		char* resourceName = "";
+		static const char* emptyResourceName = "";
+		char* resourceName = nullptr;
 		m_resourceHost->GetResourceName(&resourceName);
+		if (!resourceName)
+		{
+			return emptyResourceName;
+		}
 
 		return resourceName;
 	}
@@ -359,6 +330,16 @@ public:
 
 	lua_State* GetRunningThread();
 
+	lua_State* GetState()
+	{
+		return m_state.Get();
+	}
+
+	auto& GetPendingBookmarks()
+	{
+		return m_pendingBookmarks;
+	}
+
 	/// <summary>
 	/// Manage the fx::ProfilerComponent state while the script runtime is active
 	///
@@ -368,6 +349,16 @@ public:
 	/// e.g., DeleteFunctionReference, it requires an active script runtime.
 	/// </summary>
 	bool IScriptProfiler_Tick(bool begin);
+
+#if LUA_VERSION_NUM == 503
+	// visible for testing
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA) const luaL_Reg* GetCitizenLibs();
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA) const luaL_Reg* GetLuaLibs();
+#else
+	// visible for testing
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA54) const luaL_Reg* GetCitizenLibs();
+	static COMPONENT_EXPORT(CITIZEN_SCRIPTING_LUA54) const luaL_Reg* GetLuaLibs();
+#endif
 
 private:
 	result_t LoadFileInternal(OMPtr<fxIStream> stream, char* scriptFile);
@@ -411,6 +402,8 @@ public:
 	NS_DECL_ISCRIPTWARNINGRUNTIME;
 };
 
+int Lua_Print(lua_State* L);
+
 void ScriptTraceV(const char* string, fmt::printf_args formatList);
 
 template<typename... TArgs>
@@ -419,4 +412,5 @@ LUA_INLINE void ScriptTrace(const char* string, const TArgs&... args)
 	ScriptTraceV(string, fmt::make_printf_args(args...));
 }
 }
+
 #endif

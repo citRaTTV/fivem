@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include <atArray.h>
 #include <atPool.h>
 
@@ -40,6 +42,11 @@ using Matrix4x4 = DirectX::XMFLOAT4X4;
 
 class fwEntity;
 
+namespace streaming
+{
+	class strStreamingModule;
+}
+
 namespace rage
 {
 	class STREAMING_EXPORT fwRefAwareBase
@@ -70,14 +77,14 @@ class fwFactoryBase
 public:
 	virtual ~fwFactoryBase() = 0;
 
-	virtual TSubClass* Get(uint32_t hash) = 0;
+	virtual TSubClass* CreateBaseItem(uint32_t hash) = 0;
 
 	virtual void m3() = 0;
 	virtual void m4() = 0;
 
-	virtual void* GetOrCreate(uint32_t hash, uint32_t numEntries) = 0;
+	virtual void AddStorageBlock(uint32_t hash, uint32_t numEntries) = 0;
 
-	virtual void Remove(uint32_t hash) = 0;
+	virtual void FreeStorageBlock(uint32_t hash) = 0;
 
 	virtual void ForAllOfHash(uint32_t hash, void(*cb)(TSubClass*)) = 0;
 };
@@ -161,6 +168,38 @@ private:
 	uint16_t flags;
 };
 
+namespace rage
+{
+struct fwModelId
+{
+	union
+	{
+		uint32_t value;
+
+		struct
+		{
+			uint16_t modelIndex;
+			uint16_t mapTypesIndex : 12;
+			uint16_t isStreamed : 1;
+			uint16_t isMemLocked : 1;
+			uint16_t pad1 : 1;
+			uint16_t pad2 : 1;
+		};
+	};
+
+	fwModelId()
+		: modelIndex(0xFFFF), mapTypesIndex(0xFFF), isStreamed(0), isMemLocked(0), pad1(0), pad2(0)
+	{
+	}
+
+	fwModelId(uint32_t idx)
+		: value(idx)
+	{
+	}
+};
+
+static_assert(sizeof(fwModelId) == 4);
+
 class STREAMING_EXPORT fwArchetype : XBR_VIRTUAL_BASE_2802(0)
 {
 public:
@@ -187,13 +226,18 @@ public:
 public:
 	char pad[16];
 	uint32_t hash;
-	char pad2[16];
+
+	rage::fwModelId cachedModelId; // Inserted into padding
+
+	char pad2[12];
 	float radius;
 	float aabbMin[4];
 	float aabbMax[4];
-	uint32_t flags;
+	uint32_t flags : 31;
+	uint32_t streaming : 1;
 
-	uint8_t pad3[4];
+	uint32_t hashCopy; // Inserted into padding
+
 	fwDynamicArchetypeComponent* dynamicArchetypeComponent;
 	uint8_t assetType;
 	uint8_t pad4;
@@ -201,51 +245,42 @@ public:
 	// +100
 	uint32_t assetIndex;
 
-	// +104
-	char m_pad[53];
-	uint8_t miType : 5;
+	uint16_t numRefs : 15;
+	uint16_t isModelMissing : 1;
+
+	uint16_t assignedStreamingSlot;
+
+	char m_pad6E[4];
 };
 
-namespace rage
-{
-using fwArchetype = ::fwArchetype;
-
-struct fwModelId
-{
-	union
-	{
-		uint32_t value;
-
-		struct
-		{
-			uint16_t modelIndex;
-			uint16_t mapTypesIndex : 12;
-			uint16_t flags : 4;
-		};
-	};
-
-	fwModelId()
-		: modelIndex(0xFFFF), mapTypesIndex(0xFFF), flags(0)
-	{
-	}
-
-	fwModelId(uint32_t idx)
-		: value(idx)
-	{
-	}
-};
-
-static_assert(sizeof(fwModelId) == 4);
-
+static_assert(sizeof(fwArchetype) == 0x70);
 
 class STREAMING_EXPORT fwArchetypeManager
 {
 public:
 	static fwArchetype* GetArchetypeFromHashKey(uint32_t hash, fwModelId& id);
 
-	static fwArchetype* GetArchetypeFromHashKeySafe(uint32_t hash, fwModelId& id);
+	static const fwModelId& LookupModelId(fwArchetype* archetype);
+
+	static void UnregisterStreamedArchetype(fwArchetype* archetype);
+
+	static uint16_t RegisterPermanentArchetype(fwArchetype* archetype, uint32_t mapTypeDefIndex, bool bMemLock);
+	static uint16_t RegisterStreamedArchetype(fwArchetype* archetype, uint32_t mapTypeDefIndex);
+
+	static streaming::strStreamingModule* GetStreamingModule();
 };
+
 }
+
+using fwArchetype = rage::fwArchetype;
+
+struct CBaseModelInfo : fwArchetype
+{
+	char m_pad[45];
+	uint8_t miType : 5;
+
+	// and other stuff
+};
 
 namespace rage
 {
@@ -452,9 +487,11 @@ public:
 			boost::typeindex::ctti_type_index::type_id<T>().raw_name()
 		};
 
-		constexpr auto typeHash = HashString(typeName.substr(0, typeName.length() - boost::typeindex::detail::ctti_skip_size_at_end).substr(6));
+		constexpr auto typeHash = HashString(typeName.substr(0, typeName.length() - boost::typeindex::detail::skip().size_at_end).substr(6));
 		return this->IsOfType(typeHash);
 	}
+
+	void ProtectStreamedArchetype();
 
 private:
 	template<typename TMember>
@@ -486,43 +523,8 @@ public:
 	return (this->*(get_member<TFn>(vtbl[MapEntityMethod<offset>() / 8])))(__VA_ARGS__);
 
 private:
-	inline bool IsOfTypeH(uint32_t hash)
-	{
-		if (xbr::IsGameBuildOrGreater<2802>())
-		{
-			return (GetTypeHash() == hash);
-		}
-
-		if (xbr::IsGameBuildOrGreater<2189>())
-		{
-			return IsOfTypeRef(hash);
-		}
-
-		FORWARD_FUNC(IsOfTypeH, 0x8, hash);
-	}
-
-	inline bool IsOfTypeRef(const uint32_t& hash)
-	{
-		if (xbr::IsGameBuildOrGreater<2802>())
-		{
-			return (GetTypeHash() == hash);
-		}
-
-		FORWARD_FUNC(IsOfTypeRef, 0x8, hash);
-	}
-
-private:
-	inline uint32_t GetTypeHash()
-	{
-		if (!xbr::IsGameBuildOrGreater<2802>())
-		{
-			assert(false);
-		}
-
-		// #TODO2802: new RTTI method, a bit weird but works, definitely need to make it less dirty at some point...
-		return (*(uint32_t(__fastcall**)(char*))(*(char**)this + 0x10))((char*)this);
-	}
-
+	bool IsOfTypeH(uint32_t hash);
+	
 public:
 	inline void SetupFromEntityDef(fwEntityDef* entityDef, fwArchetype* archetype, uint32_t a3)
 	{
@@ -556,7 +558,7 @@ public:
 
 	inline void RemoveFromScene()
 	{
-		FORWARD_FUNC(AddToSceneWrap, 0x120);
+		FORWARD_FUNC(RemoveFromScene, 0x120);
 	}
 
 	inline float GetRadius()
@@ -577,15 +579,30 @@ public:
 		return Vector3(m_transform._41, m_transform._42, m_transform._43);
 	}
 
-	inline void* GetNetObject() const
-	{
-		static_assert(offsetof(fwEntity, m_netObject) == 208, "wrong GetNetObject");
-		return m_netObject;
-	}
-
 	inline uint8_t GetType() const
 	{
 		return m_entityType;
+	}
+
+	inline uint8_t GetProtectedFlags() const
+	{
+		return m_protectedFlags;
+	}
+
+	bool IsDynamicEntity() const
+	{
+		return (GetType() >= 2) && (GetType() <= 5);
+	}
+	
+	inline void* GetNetObject() const
+	{
+		static_assert(offsetof(fwEntity, m_netObject) == 208, "wrong GetNetObject");
+		return IsDynamicEntity() ? m_netObject : nullptr;
+	}
+
+	inline uint8_t GetOwnedBy() const
+	{
+		return (*(uint32_t*)((char*)this + 0xC8) >> 24) & 0x1F; // CEntity
 	}
 
 private:
@@ -594,10 +611,11 @@ private:
 	char m_pad2[8];
 	fwArchetype* m_archetype;
 	uint8_t m_entityType;
-	char m_pad3[96 - 41];
+	uint8_t m_protectedFlags;
+	char m_pad3[54];
 	Matrix4x4 m_transform;
 	char m_pad4[48];
-	void* m_netObject;
+	void* m_netObject; // CDynamicEntity
 };
 
 STREAMING_EXPORT class VehicleSeatManager
@@ -622,6 +640,22 @@ private:
 	uint8_t m_numSeats;
 
 	fwEntity* m_occupants[16];
+};
+
+STREAMING_EXPORT class CItemInfo : public rage::fwRefAwareBase
+{
+public:
+	inline uint32_t GetName() const
+	{
+		return m_name;
+	}
+
+private:
+	char m_pad[8]; // #TODO: fwRefAwareBase needs updating
+	uint32_t m_name;
+	uint32_t m_model;
+	uint32_t m_audio;
+	uint32_t m_slot;
 };
 
 struct CHandlingObject
@@ -779,6 +813,7 @@ private:
 		Impl<0x918> m1604;
 		Impl<0x938> m2060;
 		Impl<0x918> m2802;
+		Impl<0x960> m3095;
 	} impl;
 
 public:
@@ -786,7 +821,11 @@ public:
 
 	inline CHandlingData* GetHandlingData()
 	{
-		if (xbr::IsGameBuildOrGreater<2802>())
+		if (xbr::IsGameBuildOrGreater<3095>())
+		{
+			return impl.m3095.m_handlingData;
+		}
+		else if (xbr::IsGameBuildOrGreater<2802>())
 		{
 			return impl.m2802.m_handlingData;
 		}
@@ -804,8 +843,12 @@ public:
 	{
 		// Use an alignment byte within CHandlingDataMgr to represent the handling as hooked.
 		*((char*)ptr + 28) = 1;
-		
-		if (xbr::IsGameBuildOrGreater<2802>())
+
+		if (xbr::IsGameBuildOrGreater<3095>())
+		{
+			impl.m3095.m_handlingData = ptr;
+		}
+		else if (xbr::IsGameBuildOrGreater<2802>())
 		{
 			impl.m2802.m_handlingData = ptr;
 		}
@@ -889,6 +932,16 @@ struct MapDataVec4
 	}
 };
 
+struct STREAMING_EXPORT CDistantLODLight
+{
+	virtual ~CDistantLODLight() = default;
+
+	atArray<std::array<float, 3>> positions;
+	atArray<uint32_t> rgbi;
+	uint16_t numStreetLights;
+	uint16_t category;
+};
+
 struct STREAMING_EXPORT CMapData : rage::sysUseAllocator
 {
 	CMapData();
@@ -909,7 +962,9 @@ struct STREAMING_EXPORT CMapData : rage::sysUseAllocator
 	MapDataVec4 entitiesExtentsMax; // +72
 	atArray<fwEntityDef*> entities;
 
-	char pad[512 - 104];
+	char pad_68[280];
+	CDistantLODLight distantLodLights; // +392
+	char pad_1B8[80];
 
 	// etc.
 };

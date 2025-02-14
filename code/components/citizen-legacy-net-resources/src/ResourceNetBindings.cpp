@@ -49,6 +49,17 @@
 
 #include <json.hpp>
 
+#include "NetBitVersion.h"
+#include "NetEvent.h"
+#include "NetEventPacketHandler.h"
+#include "ReassembledEventPacketHandler.h"
+#include "ResourceStartPacketHandler.h"
+#include "ResourceStopPacketHandler.h"
+#include "ScriptWarnings.h"
+#include "ServerCommand.h"
+
+#include "NetLibraryResourcesComponent.h"
+
 static tbb::concurrent_queue<std::function<void()>> executeNextGameFrame;
 static NetAddress g_netAddress;
 
@@ -76,46 +87,23 @@ static std::string CrackResourceName(const std::string& uri)
 // helper to UrlEncode for server releases that support this
 static auto UrlEncodeWrap(const std::string& base, const std::string& str)
 {
-	if (Instance<ICoreGameInit>::Get()->NetProtoVersion >= 0x201902111010)
+	auto baseUrl = skyr::make_url(base);
+
+	if (baseUrl)
 	{
-		auto baseUrl = skyr::make_url(base);
+		std::string strCopy(str);
+		boost::algorithm::replace_all(strCopy, "+", "%2B");
 
-		if (baseUrl)
+		auto url = skyr::make_url(strCopy, *baseUrl);
+
+		if (url)
 		{
-			std::string strCopy(str);
-			boost::algorithm::replace_all(strCopy, "+", "%2B");
-
-			auto url = skyr::make_url(strCopy, *baseUrl);
-
-			if (url)
-			{
-				return url->href();
-			}
+			return url->href();
 		}
 	}
 
 	return base + str;
 };
-
-class NetLibraryResourcesComponent : public fwRefCountable, public fx::IAttached<NetLibrary>
-{
-public:
-	virtual void AttachToObject(NetLibrary* netLibrary) override;
-
-private:
-	void UpdateResources(const std::string& updateList, const std::function<void()>& doneCb);
-
-	void UpdateOneResource();
-
-	bool RequestResourceFileSet(fx::Resource* resource, const std::string& setName);
-
-private:
-	std::queue<std::string> m_resourceUpdateQueue;
-
-	NetLibrary* m_netLibrary;
-};
-
-DECLARE_INSTANCE_TYPE(NetLibraryResourcesComponent);
 
 static std::mutex progressMutex;
 static std::optional<std::tuple<std::string, int, int, bool>> nextProgress;
@@ -206,6 +194,54 @@ static pplx::task<std::vector<ResultTuple>> DownloadResources(std::vector<std::s
 	}
 
 	co_return list;
+}
+
+namespace fx
+{
+	size_t g_eventReassemblyGameFrameCookie = -1;
+	
+	void TriggerLatentServerEventInternal(fx::ScriptContext& context)
+	{
+		std::string eventName = context.GetArgument<const char*>(0);
+		size_t payloadSize = context.GetArgument<uint32_t>(2);
+
+		std::string_view eventPayload = std::string_view(context.GetArgument<const char*>(1), payloadSize);
+
+		int bps = context.GetArgument<int>(3);
+
+		auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+		if (Instance<ICoreGameInit>::Get()->IsNetVersionOrHigher(net::NetBitVersion::netVersion5))
+		{
+			reassembler->TriggerEventV2(0, eventName, eventPayload, bps);
+		}
+		else
+		{
+			reassembler->TriggerEvent(0, std::string_view{ eventName.c_str(), eventName.size() + 1 }, eventPayload, bps);
+		}
+	}
+
+	void TriggerDisabledLatentServerEventInternal(fx::ScriptContext& context)
+	{
+		fx::scripting::Warningf("natives", "TRIGGER_LATENT_SERVER_EVENT_INTERNAL requires setr sv_enableNetEventReassembly true\n");
+	}
+
+	void EnableEventReassemblyChanged(internal::ConsoleVariableEntry<bool>* variableEntry)
+	{
+		OnGameFrame.Disconnect(g_eventReassemblyGameFrameCookie);
+
+		g_eventReassemblyGameFrameCookie = -1;
+
+		if (variableEntry->GetRawValue())
+		{
+			g_eventReassemblyGameFrameCookie = OnGameFrame.Connect([]()
+			{
+				auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+				reassembler->NetworkTick();
+			});
+		}
+	}
+
+	ConVar<bool> g_enableEventReassembly("sv_enableNetEventReassembly", ConVar_Replicated, true, EnableEventReassemblyChanged);
 }
 
 void NetLibraryResourcesComponent::UpdateOneResource()
@@ -621,8 +657,11 @@ void NetLibraryResourcesComponent::AttachToObject(NetLibrary* netLibrary)
 
 		// reinit the reassembler
 		auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+		// cleanup old server event reassembly target
 		reassembler->UnregisterTarget(0);
-		reassembler->RegisterTarget(0);
+		// registers the server as a target for the event reassembly
+		// 0xFF sets the maximum amount of pending events to infinite
+		reassembler->RegisterTarget(0, 0xFF);
 	});
 
 	netLibrary->OnConnectionErrorEvent.Connect([](const char* error)
@@ -678,138 +717,41 @@ void NetLibraryResourcesComponent::AttachToObject(NetLibrary* netLibrary)
 		}
 	});
 
-	OnGameFrame.Connect([]()
+	// Used to enable the EventReassemblyComponent when the setr sv_enableNetEventReassembly is not inside the server config
+	fx::EnableEventReassemblyChanged(fx::g_enableEventReassembly.GetHelper().get());
+
+	netLibrary->AddPacketHandler<fx::ReassembledEventPacketHandler>(true);
+	netLibrary->AddPacketHandler<fx::ReassembledEventPacketV2Handler>(true);
+	netLibrary->AddPacketHandler<fx::NetEventPacketHandler>(false);
+	netLibrary->AddPacketHandler<fx::ResourceStopPacketHandler>(false);
+	netLibrary->AddPacketHandler<fx::ResourceStartPacketHandler>(false);
+
+	fx::ScriptEngine::RegisterNativeHandler("TRIGGER_LATENT_SERVER_EVENT_INTERNAL", [](fx::ScriptContext& context)
 	{
-		auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
-		reassembler->NetworkTick();
-	});
-
-	netLibrary->AddReliableHandler(
-	"msgReassembledEvent", [](const char* buf, size_t len)
-	{
-		auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
-		reassembler->HandlePacket(0, std::string_view{ buf, len });
-	},
-	true);
-
-	netLibrary->AddReliableHandler("msgNetEvent", [](const char* buf, size_t len)
-	{
-		net::Buffer buffer(reinterpret_cast<const uint8_t*>(buf), len);
-
-		// get the source net ID
-		uint16_t sourceNetID = buffer.Read<uint16_t>();
-
-		// get length of event name and read the event name
-		static char eventName[65536];
-
-		uint16_t nameLength = buffer.Read<uint16_t>();
-		buffer.Read(eventName, nameLength);
-
-		// read the data
-		size_t dataLen = len - nameLength - (sizeof(uint16_t) * 2);
-		std::vector<char> eventData(dataLen);
-
-		buffer.Read(&eventData[0], dataLen);
-
-		// convert the source net ID to a string
-		std::string source = "net:" + std::to_string(sourceNetID);
-
-		// get the resource manager and eventing component
-		static fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
-		static fwRefContainer<fx::ResourceEventManagerComponent> eventManager = resourceManager->GetComponent<fx::ResourceEventManagerComponent>();
-
-		// and queue the event
-		eventManager->QueueEvent(std::string(eventName), std::string(&eventData[0], eventData.size()), source);
-	});
-
-	netLibrary->AddReliableHandler("msgResStop", [](const char* buf, size_t len)
-	{
-		std::string resourceName(buf, len);
-
-		fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
-		resourceManager->MakeCurrent();
-
-		auto resource = resourceManager->GetResource(resourceName);
-
-		if (resource.GetRef() == nullptr)
+		if (fx::g_enableEventReassembly.GetValue())
 		{
-			trace("Server requested resource %s to be stopped, but we don't know that resource\n", resourceName.c_str());
-			return;
-		}
-
-#if 0
-			if (resource->GetState() != ResourceStateRunning)
-			{
-				trace("Server requested resource %s to be stopped, but it's not running\n", resourceName.c_str());
-				return;
-			}
-#endif
-
-		resource->Stop();
-	});
-
-	netLibrary->AddReliableHandler("msgResStart", [this](const char* buf, size_t len)
-	{
-		std::string resourceName(buf, len);
-
-		fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
-		resourceManager->MakeCurrent();
-
-		auto resource = resourceManager->GetResource(resourceName);
-
-		if (resource.GetRef() != nullptr)
+			TriggerLatentServerEventInternal(context);
+		} 
+		else
 		{
-#if 0
-				if (resource->GetState() != ResourceStateStopped)
-				{
-					trace("Server requested resource %s to be started, but it's not stopped\n", resourceName.c_str());
-					return;
-				}
-#endif
-		}
-
-		std::lock_guard _(g_resourceStartRequestMutex);
-		if (g_resourceStartRequestSet.find(resourceName) == g_resourceStartRequestSet.end())
-		{
-			g_resourceStartRequestSet.insert(resourceName);
-			m_resourceUpdateQueue.push(resourceName);
-
-			executeNextGameFrame.push([this]()
-			{
-				UpdateOneResource();
-			});
+			TriggerDisabledLatentServerEventInternal(context);
 		}
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("TRIGGER_SERVER_EVENT_INTERNAL", [netLibrary](fx::ScriptContext& context)
 	{
-		std::string eventName = context.GetArgument<const char*>(0);
-		size_t payloadSize = context.GetArgument<uint32_t>(2);
-
-		std::string eventPayload = std::string(context.GetArgument<const char*>(1), payloadSize);
-
-		netLibrary->OnTriggerServerEvent(eventName, eventPayload);
-
-		net::Buffer buffer;
-		buffer.Write<uint16_t>(eventName.size() + 1);
-		buffer.Write(eventName.c_str(), eventName.size() + 1);
-
-		buffer.Write(eventPayload.c_str(), eventPayload.size());
-
-		netLibrary->SendReliableCommand("msgServerEvent", reinterpret_cast<const char*>(buffer.GetBuffer()), buffer.GetCurOffset());
-	});
-
-	fx::ScriptEngine::RegisterNativeHandler("TRIGGER_LATENT_SERVER_EVENT_INTERNAL", [netLibrary](fx::ScriptContext& context)
-	{
-		std::string eventName = context.GetArgument<const char*>(0);
+		std::string_view eventName = context.GetArgument<const char*>(0);
 		size_t payloadSize = context.GetArgument<uint32_t>(2);
 
 		std::string_view eventPayload = std::string_view(context.GetArgument<const char*>(1), payloadSize);
 
-		int bps = context.GetArgument<int>(3);
+		netLibrary->OnTriggerServerEvent(eventName, eventPayload);
 
-		auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
-		reassembler->TriggerEvent(0, std::string_view{ eventName.c_str(), eventName.size() + 1 }, eventPayload, bps);
+		net::packet::ClientServerEventPacket clientServerEventPacket;
+		// null terminated event name
+		clientServerEventPacket.data.eventName = {reinterpret_cast<uint8_t*>(const_cast<char*>(context.GetArgument<const char*>(0))), eventName.size() + 1};
+		clientServerEventPacket.data.eventData = {reinterpret_cast<uint8_t*>(const_cast<char*>(eventPayload.data())), eventPayload.size()};
+		netLibrary->SendNetPacket(clientServerEventPacket);
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("REQUEST_RESOURCE_FILE_SET", [this](fx::ScriptContext& context)
@@ -842,10 +784,19 @@ void NetLibraryResourcesComponent::AttachToObject(NetLibrary* netLibrary)
 		});
 	});
 
+	static bool gameLoaded = false;
+
+	Instance<ICoreGameInit>::Get()->OnGameFinalizeLoad.Connect([]()
+	{
+		gameLoaded = true;
+	});
+
 	static bool inSessionReset = false;
 
 	Instance<ICoreGameInit>::Get()->OnShutdownSession.Connect([]()
 	{
+		gameLoaded = false;
+
 		AddCrashometry("reset_resources", "true");
 
 		inSessionReset = true;
@@ -871,20 +822,15 @@ void NetLibraryResourcesComponent::AttachToObject(NetLibrary* netLibrary)
 
 	console::GetDefaultContext()->GetCommandManager()->FallbackEvent.Connect([netLibrary](const std::string& cmd, const ProgramArguments& args, const std::string& context)
 	{
-		if (netLibrary->GetConnectionState() != NetLibrary::CS_ACTIVE)
+		if (netLibrary->GetConnectionState() != NetLibrary::CS_ACTIVE || !gameLoaded)
 		{
 			return true;
 		}
 
-		std::string s = console::GetDefaultContext()->GetCommandManager()->GetRawCommand();
-
-		net::Buffer buffer;
-		buffer.Write<uint16_t>(s.size());
-		buffer.Write(s.c_str(), std::min(s.size(), static_cast<size_t>(INT16_MAX)));
-		buffer.Write<uint32_t>(HashString(context.c_str()));
-
-		netLibrary->SendReliableCommand("msgServerCommand", reinterpret_cast<const char*>(buffer.GetBuffer()), buffer.GetCurOffset());
-
+		net::packet::ClientServerCommandPacket serverCommand;
+		const std::string& commandName = console::GetDefaultContext()->GetCommandManager()->GetRawCommand();
+		serverCommand.data.command = std::string_view{commandName.data(), commandName.size()};
+		netLibrary->SendNetPacket(serverCommand);
 		return false;
 	},
 	99999);
@@ -894,9 +840,16 @@ static NetLibrary* g_netLibrary;
 
 static class : public fx::EventReassemblySink
 {
-	virtual void SendPacket(int target, std::string_view packet) override
+	void SendPacket(int target, std::string_view packet) override
 	{
-		g_netLibrary->SendUnreliableCommand("msgReassembledEvent", packet.data(), packet.size());
+		net::packet::ReassembledEventPacket reassembled;
+		reassembled.data.data = net::Span{reinterpret_cast<uint8_t*>(const_cast<char*>(packet.data())), packet.size()};
+		g_netLibrary->SendNetPacket(reassembled, false);
+	}
+
+	void SendPacketV2(int target, net::packet::ReassembledEventV2Packet& packet) override
+	{
+		g_netLibrary->SendNetPacket(packet);
 	}
 } g_eventSink;
 

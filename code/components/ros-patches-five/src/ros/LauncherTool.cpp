@@ -12,6 +12,8 @@
 
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/directory.hpp>
+#include <boost/range/iterator_range_core.hpp>
 
 #include <botan/auto_rng.h>
 #include <botan/rsa.h>
@@ -119,14 +121,7 @@ static HICON hIcon;
 
 static InitFunction iconFunction([] ()
 {
-	if (!CfxIsSinglePlayer())
-	{
-		hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(1));
-	}
-	else
-	{
-		hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(202));
-	}
+	hIcon = LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(1));
 });
 
 static HICON WINAPI LoadIconStub(HINSTANCE, LPCSTR)
@@ -239,14 +234,6 @@ static DWORD WINAPI CertGetNameStringStubA(_In_ PCCERT_CONTEXT pCertContext, _In
 	else if (certString == "DigiCert SHA2 Assured ID Code Signing CA")
 	{
 		newName = "Entrust Code Signing CA - OVCS1";
-	}
-	else if (xbr::IsGameBuild<372>() && certString == "Entrust Code Signing CA - OVCS1")
-	{
-		newName = "Entrust Code Signing Certification Authority - L1D";
-	}
-	else if (xbr::IsGameBuild<372>() && certString == "Rockstar Games, Inc.")
-	{
-		newName = "Take-Two Interactive Software, Inc.";
 	}
 
 	// return if no such name
@@ -912,9 +899,9 @@ static void Launcher_Run(const boost::program_options::variables_map& map)
 
 		if (boost::filesystem::exists(appDataPath, ec))
 		{
-			for (boost::filesystem::directory_iterator it(appDataPath); it != boost::filesystem::directory_iterator(); it++)
+			for(auto& entry : boost::make_iterator_range(boost::filesystem::directory_iterator(appDataPath), {}))
 			{
-				auto path = it->path();
+				auto path = entry.path();
 
 				if (path.filename().string().find("in-", 0) == 0 || path.filename().string().find("out-", 0) == 0)
 				{
@@ -1039,21 +1026,11 @@ static InitFunction initFunctionF([]()
 	MH_EnableHook(MH_ALL_HOOKS);
 });
 
-#include <CrossBuildRuntime.h>
-
 static HookFunction hookFunction([] ()
 {
 	if (!IsWindows7SP1OrGreater())
 	{
 		FatalError("Windows 7 SP1 or higher is required to run the FiveM ros:five component.");
-	}
-
-	
-	if (xbr::IsGameBuild<372>())
-	{
-		hook::iat("crypt32.dll", CertGetNameStringStubW, "CertGetNameStringW");
-		hook::iat("crypt32.dll", CertGetNameStringStubA, "CertGetNameStringA");
-		hook::iat("wintrust.dll", WinVerifyTrustStub, "WinVerifyTrust");
 	}
 
 	// newer SC SDK will otherwise overflow in cert name
